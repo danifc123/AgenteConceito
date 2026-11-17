@@ -79,7 +79,7 @@ import time
 from collections import deque
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Literal
 
 from anyio import to_thread
@@ -141,6 +141,20 @@ _TIMEOUT_POR_CHAMADO_SEGUNDOS = 420
 # categoria (categoria atual mantida) e tenta de novo na próxima.
 _TIMEOUT_AQUECIMENTO_EMBEDDINGS_SEGUNDOS = 600
 
+# Chamado que estoura `_TIMEOUT_POR_CHAMADO_SEGUNDOS` em tantas rodadas
+# SEGUIDAS para de ser tentado: vai direto pra um técnico (nota privada
+# explicando) e ganha um aviso fixo no painel do poller. Sem isso, um
+# chamado "envenenado" (anexo/texto que sempre trava a análise) gastaria
+# o limite inteiro em toda rodada, pra sempre, atrasando todos os outros.
+# Contagem em memória: um restart zera (no pior caso, mais 3 tentativas).
+_MAX_ESTOUROS_SEGUIDOS = 3
+_TIMEOUT_ENCAMINHAMENTO_SEGUNDOS = 60
+_estouros_por_chamado: dict[int, int] = {}
+# Avisos do painel ("chamado X encaminhado sem triagem"), últimas 24h.
+_JANELA_AVISOS = timedelta(hours=24)
+# Horário de Brasília (sem horário de verão desde 2019) — só pro texto do aviso.
+_FUSO_LOCAL = timezone(timedelta(hours=-3))
+
 # Regra de negócio (decisão do Daniel, 2026-11): com a IA fora do ar, o
 # chamado é ADIADO (fica intocado e a IA tenta de novo na próxima rodada),
 # nunca liberado/escalado só porque a IA não respondeu. Se a IA continuar
@@ -185,6 +199,7 @@ class EstadoPoller:
     # campo, diferente dos outros, DECIDE fluxo: ver `_ia_em_modo_regra`.
     ia_indisponivel_desde: datetime | None = None
     ia_erro: str | None = None
+    avisos: deque[tuple[datetime, str]] = field(default_factory=lambda: deque(maxlen=20))
 
 
 _estado_poller = EstadoPoller()
@@ -231,6 +246,11 @@ def _estado_poller_para_json() -> dict:
         if _estado_poller.proxima_rodada_em
         else None,
         "erro": _estado_poller.erro,
+        "avisos": [
+            mensagem
+            for em, mensagem in _estado_poller.avisos
+            if datetime.now(UTC) - em <= _JANELA_AVISOS
+        ],
         "ia": {
             "indisponivel_desde": _estado_poller.ia_indisponivel_desde.isoformat()
             if _estado_poller.ia_indisponivel_desde
@@ -895,7 +915,11 @@ async def processar_chamado_novo(
 
 
 async def _escalar_para_tecnico(
-    cliente: ClienteGLPI, chamado: Chamado, cargas: dict[str, int], turnos: list[TurnoConversa]
+    cliente: ClienteGLPI,
+    chamado: Chamado,
+    cargas: dict[str, int],
+    turnos: list[TurnoConversa],
+    nota: str | None = None,
 ) -> str:
     """Chamado que segue sem informação suficiente (bateu
     `_LIMITE_RODADAS_ESCLARECIMENTO`, ou o plano B repetiria a mesma
@@ -929,7 +953,7 @@ async def _escalar_para_tecnico(
     tecnico = escolher_tecnico(area, cargas, f"{chamado.titulo}\n{chamado.descricao}")
     if chamado.tecnico_atribuido != tecnico.identificador:
         await cliente.atribuir(chamado.id, area, tecnico.identificador)
-    resumo = _resumo_esclarecimento_incompleto(turnos) if turnos else None
+    resumo = nota or (_resumo_esclarecimento_incompleto(turnos) if turnos else None)
     await cliente.atualizar_avaliacao(chamado.id, "fila_atendimento", resumo, privado=True)
     cargas[tecnico.identificador] = cargas.get(tecnico.identificador, 0) + 1
     return tecnico.nome
@@ -1102,16 +1126,64 @@ def _registrar_adiados(adiados: list[int]) -> None:
 def _registrar_timeout_chamado(chamado: Chamado) -> None:
     """Chamado que estourou `_TIMEOUT_POR_CHAMADO_SEGUNDOS` — loga no
     servidor E no painel "Ver logs", pra dar pra ver QUAL chamado está
-    segurando a triagem (antes, o lote simplesmente parava sem rastro)."""
+    segurando a triagem (antes, o lote simplesmente parava sem rastro).
+    Conta o estouro: no `_MAX_ESTOUROS_SEGUIDOS`º, a próxima rodada
+    encaminha o chamado direto pra um técnico (`_encaminhar_por_estouros`)."""
+    estouros = _estouros_por_chamado.get(chamado.id, 0) + 1
+    _estouros_por_chamado[chamado.id] = estouros
     _logger.error(
-        "Chamado %s passou de %ss sendo processado — pulado nesta rodada",
+        "Chamado %s passou de %ss sendo processado (%s/%s) — pulado nesta rodada",
         chamado.id,
         _TIMEOUT_POR_CHAMADO_SEGUNDOS,
+        estouros,
+        _MAX_ESTOUROS_SEGUIDOS,
+    )
+    proximo = (
+        "será encaminhado direto pra um técnico na próxima rodada"
+        if estouros >= _MAX_ESTOUROS_SEGUIDOS
+        else "pulado nesta rodada"
     )
     _publicar_log(
         f"Chamado #{chamado.id} — {chamado.titulo}: passou de {_TIMEOUT_POR_CHAMADO_SEGUNDOS}s "
-        "sem resposta (IA/GLPI/anexo), pulado nesta rodada"
+        f"sem resposta (IA/GLPI/anexo), tentativa {estouros}/{_MAX_ESTOUROS_SEGUIDOS} — {proximo}"
     )
+
+
+def _deve_encaminhar_sem_triagem(chamado: Chamado) -> bool:
+    return _estouros_por_chamado.get(chamado.id, 0) >= _MAX_ESTOUROS_SEGUIDOS
+
+
+async def _encaminhar_por_estouros(chamado: Chamado, cargas: dict[str, int]) -> None:
+    """Desiste da triagem automática desse chamado: atribui um técnico (mesma
+    escolha por área/carga do escalonamento normal), muda pra fila de
+    atendimento e deixa uma nota PRIVADA explicando o motivo. Não chama a
+    IA nem baixa anexo (o que provavelmente trava). Se o próprio
+    encaminhamento falhar (GLPI fora), tenta de novo na próxima rodada."""
+    minutos = round(_TIMEOUT_POR_CHAMADO_SEGUNDOS / 60)
+    nota = (
+        "Triagem automática interrompida: a análise deste chamado passou de "
+        f"{minutos} min em {_MAX_ESTOUROS_SEGUIDOS} rodadas seguidas (possível anexo ou texto que trava "
+        "a análise). Encaminhado direto para atendimento, sem avaliação da IA — confira a categoria e "
+        "se as informações estão completas."
+    )
+    try:
+        tecnico = await asyncio.wait_for(
+            _escalar_para_tecnico(_cliente, chamado, cargas, [], nota=nota),
+            timeout=_TIMEOUT_ENCAMINHAMENTO_SEGUNDOS,
+        )
+    except Exception as erro:
+        _logger.exception("Falha encaminhando o chamado %s sem triagem", chamado.id)
+        _publicar_log(f"Falha encaminhando o chamado #{chamado.id} sem triagem ({erro!r}) — tenta de novo")
+        return
+    _estouros_por_chamado.pop(chamado.id, None)
+    agora = datetime.now(UTC)
+    mensagem = (
+        f"Chamado #{chamado.id} — {chamado.titulo}: a análise travou em {_MAX_ESTOUROS_SEGUIDOS} rodadas "
+        f"seguidas; encaminhado direto para {tecnico}, sem triagem da IA "
+        f"({agora.astimezone(_FUSO_LOCAL):%d/%m %H:%M})."
+    )
+    _estado_poller.avisos.append((agora, mensagem))
+    _publicar_log(f"AVISO {mensagem}")
 
 
 def _avisar_ia_indisponivel(tipo: str) -> Callable[[str, BaseException], None]:
@@ -1216,6 +1288,9 @@ async def verificar_chamados_aguardando_resposta(
                 continue
 
             inicio = time.monotonic()
+            if _deve_encaminhar_sem_triagem(chamado):
+                await _encaminhar_por_estouros(chamado, cargas)
+                continue
             resultado = await asyncio.wait_for(
                 processar_chamado_novo(
                     _cliente,
@@ -1247,6 +1322,7 @@ async def verificar_chamados_aguardando_resposta(
             duracao_ms,
         )
         _publicar_log(f"Chamado #{chamado.id} — {chamado.titulo}: {_descricao_acao(resultado)}")
+        _estouros_por_chamado.pop(chamado.id, None)
         processados += 1
 
     _registrar_adiados(adiados)
@@ -1312,6 +1388,9 @@ async def verificar_chamados_pendentes(
                 chamado_entra_na_amostra, chamado.id, chamado.criado_em
             ):
                 continue
+            if _deve_encaminhar_sem_triagem(chamado):
+                await _encaminhar_por_estouros(chamado, cargas)
+                continue
             resultado = await asyncio.wait_for(
                 processar_chamado_novo(
                     _cliente,
@@ -1343,6 +1422,7 @@ async def verificar_chamados_pendentes(
             duracao_ms,
         )
         _publicar_log(f"Chamado #{chamado.id} — {chamado.titulo}: {_descricao_acao(resultado)}")
+        _estouros_por_chamado.pop(chamado.id, None)
         processados += 1
 
     _registrar_adiados(adiados)

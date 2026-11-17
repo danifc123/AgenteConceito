@@ -72,8 +72,10 @@ def _embedding_fake_por_padrao(monkeypatch):
         chamados_module, "criar_cliente_embedding_protegido", lambda *_args, **_kwargs: _OllamaClienteFake()
     )
     chamados_module._estado_poller = chamados_module.EstadoPoller()
+    chamados_module._estouros_por_chamado.clear()
     yield
     chamados_module._estado_poller = chamados_module.EstadoPoller()
+    chamados_module._estouros_por_chamado.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -1465,6 +1467,86 @@ class TestIaForaDoAr:
         await _executar_uma_rodada()
 
         assert chamados_module._estado_poller.ia_indisponivel_desde == desde
+
+
+class TestChamadoQueSempreEstouraOTempo:
+    """Chamado "envenenado": estoura o limite em toda rodada. Depois de
+    `_MAX_ESTOUROS_SEGUIDOS` estouros seguidos, para de ser tentado e vai
+    direto pra um técnico, com nota privada e aviso no painel."""
+
+    @pytest.fixture
+    def cenario(self, monkeypatch):
+        cliente = _ClienteGLPIFake([_chamado(id_=1, categoria_id=999), _chamado(id_=2, categoria_id=999)])
+        self.travar = True
+        original = cliente.buscar_followups
+
+        async def _followups(chamado_id):
+            if chamado_id == 1 and self.travar:
+                await asyncio.Event().wait()
+            return await original(chamado_id)
+
+        cliente.buscar_followups = _followups
+        monkeypatch.setattr(chamados_module, "_cliente", cliente)
+        monkeypatch.setattr(chamados_module, "_TIMEOUT_POR_CHAMADO_SEGUNDOS", 0.05)
+        monkeypatch.setattr(
+            chamados_module, "criar_cliente_protegido", lambda *_a, **_k: _OllamaClienteFake(suficiente=True)
+        )
+        # Chamado 2 já foi triado na 1ª rodada; depois disso só o 1 aparece como "novo".
+        return cliente
+
+    async def _rodadas(self, quantidade: int) -> None:
+        for _ in range(quantidade):
+            await asyncio.wait_for(verificar_chamados_pendentes(usar_ia=True), timeout=5)
+
+    async def test_tres_estouros_seguidos_encaminham_direto_pro_tecnico(self, cenario):
+        cliente = cenario
+
+        await self._rodadas(3)
+        assert [a for a in cliente.avaliacoes if a[0] == 1] == []  # ainda não mexeu no chamado 1
+        assert any("tentativa 3/3" in linha for linha in chamados_module._historico_log)
+
+        await self._rodadas(1)
+
+        avaliacoes_1 = [a for a in cliente.avaliacoes if a[0] == 1]
+        assert len(avaliacoes_1) == 1
+        _id, status, nota = avaliacoes_1[0]
+        assert status == "fila_atendimento"
+        assert "Triagem automática interrompida" in nota
+        assert cliente.avaliacoes_privadas[cliente.avaliacoes.index(avaliacoes_1[0])] is True
+        assert any(chamado_id == 1 for chamado_id, *_ in cliente.atribuicoes)
+        avisos = _estado_poller_para_json()["avisos"]
+        assert len(avisos) == 1 and "#1" in avisos[0]
+        assert 1 not in chamados_module._estouros_por_chamado
+
+    async def test_sucesso_no_meio_zera_a_contagem(self, cenario):
+        cliente = cenario
+
+        await self._rodadas(2)
+        self.travar = False
+        await self._rodadas(1)  # chamado 1 é triado normalmente
+
+        assert (1, "fila_atendimento", None) in cliente.avaliacoes
+        assert 1 not in chamados_module._estouros_por_chamado
+        assert _estado_poller_para_json()["avisos"] == []
+
+    async def test_falha_no_encaminhamento_tenta_de_novo_na_proxima_rodada(self, cenario):
+        cliente = cenario
+        await self._rodadas(3)
+        atribuir_original = cliente.atribuir
+        falhar = {"vezes": 1}
+
+        async def _atribuir(chamado_id, area, tecnico):
+            if chamado_id == 1 and falhar["vezes"]:
+                falhar["vezes"] -= 1
+                raise RuntimeError("GLPI fora")
+            await atribuir_original(chamado_id, area, tecnico)
+
+        cliente.atribuir = _atribuir
+
+        await self._rodadas(1)
+        assert [a for a in cliente.avaliacoes if a[0] == 1] == []
+        await self._rodadas(1)
+        assert len([a for a in cliente.avaliacoes if a[0] == 1]) == 1
 
 
 class TestIniciarPoller:

@@ -25,6 +25,9 @@ interface RespostaStatusPoller {
   ultima_rodada_em: string | null;
   proxima_rodada_em: string | null;
   erro: string | null;
+  /** Chamados que travaram a análise em várias rodadas seguidas e foram
+   * encaminhados direto pra um técnico, sem triagem (últimas 24h). */
+  avisos?: string[];
   ia?: EstadoIaTriagem;
 }
 
@@ -42,6 +45,7 @@ export class PollerTi {
   readonly proximaRodadaEm = signal<string | null>(null);
   readonly erro = signal<string | null>(null);
   readonly ia = signal<EstadoIaTriagem | null>(null);
+  readonly avisos = signal<string[]>([]);
   readonly logs = signal<string[]>([]);
 
   private assinaturaLogs: Subscription | null = null;
@@ -54,6 +58,7 @@ export class PollerTi {
         this.proximaRodadaEm.set(resposta.proxima_rodada_em);
         this.erro.set(resposta.erro);
         this.ia.set(resposta.ia ?? null);
+        this.avisos.set(resposta.avisos ?? []);
       },
     });
   }

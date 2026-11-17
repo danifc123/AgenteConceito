@@ -113,6 +113,15 @@
         }
       </div>
 
+      @if (avisos().length) {
+        <div class="aviso-atencao" role="status">
+          <p class="aviso-atencao-titulo">Encaminhados sem triagem da IA</p>
+          @for (aviso of avisos(); track $index) {
+            <p class="aviso-atencao-item">{{ aviso }}</p>
+          }
+        </div>
+      }
+
       @if (erro(); as mensagemErro) {
         <div class="aviso-erro">{{ mensagemErro }}</div>
       }

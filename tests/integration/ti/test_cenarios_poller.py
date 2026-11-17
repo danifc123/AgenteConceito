@@ -299,7 +299,9 @@ async def test_oci_chat_travada_adia_o_lote_sem_mexer_nos_chamados(ambiente):
     ambiente.oci.chat_modo = "travar"
 
     duracao = await ambiente.rodada()
-    _relatar("OCI chat travada (7 chamados)", duracao, f"requisições de chat: {ambiente.oci.chat_requisicoes}")
+    _relatar(
+        "OCI chat travada (7 chamados)", duracao, f"requisições de chat: {ambiente.oci.chat_requisicoes}"
+    )
 
     # Só o 1º chamado espera (1 tentativa + 1 retry de 2s); o resto é adiado na hora.
     assert ambiente.oci.chat_requisicoes == 2
@@ -475,7 +477,9 @@ async def test_pedido_de_acesso_ao_banco_que_cita_power_bi_vai_pra_categoria_cer
     """Caso real: pedido de acesso de leitura a views do banco via Excel,
     aberto em "Power B.I > Dúvida" porque o texto cita Power BI como
     comparação. A IA recebe os grupos mais próximos inteiros e escolhe."""
-    power_bi_duvida = next((c.id, c.nome) for c in CATEGORIAS_ATRIBUIVEIS if c.nome.endswith("Power B.I > Dúvida"))
+    power_bi_duvida = next(
+        (c.id, c.nome) for c in CATEGORIAS_ATRIBUIVEIS if c.nome.endswith("Power B.I > Dúvida")
+    )
     chamado = ambiente.chamado(
         "Solicitação de acesso somente leitura a views do banco via Excel (Power Query)",
         descricao=(
@@ -494,3 +498,31 @@ async def test_pedido_de_acesso_ao_banco_que_cita_power_bi_vai_pra_categoria_cer
     _relatar("pedido de acesso ao banco citando Power BI", 0, f"categoria final: {nome_final}")
     assert nome_final.endswith("Banco de Dados > Permissões")
     assert ambiente.foi_liberado_pra_tecnico(chamado)
+
+
+async def test_chamado_que_sempre_estoura_o_tempo_vai_pro_tecnico_na_4a_rodada(ambiente, monkeypatch):
+    """Um chamado cuja análise SEMPRE passa do limite (aqui: a IA demora
+    demais só pra ele) não pode gastar o limite em toda rodada pra sempre.
+    3 estouros seguidos → na rodada seguinte vai direto pra um técnico,
+    com nota privada e aviso no painel; os outros chamados seguem normais."""
+    monkeypatch.setattr(chamados_module, "_TIMEOUT_POR_CHAMADO_SEGUNDOS", 3)
+    chamados_module._estouros_por_chamado.clear()
+    envenenado = ambiente.chamado("[lento] Erro ao abrir relatório gigante do Protheus")
+    ambiente.oci.chat_atraso_por_marcador = {"[lento]": 1.8}  # 2 chamadas de chat = 3.6s > 3s
+
+    for rodada in range(1, 4):
+        normal = ambiente.chamado(f"Impressora {rodada} com erro 0x0000011b")
+        await ambiente.rodada()
+        assert ambiente.foi_liberado_pra_tecnico(normal)  # os outros não esperam pelo envenenado
+        assert ambiente.esta_intocado(envenenado)
+        assert f"tentativa {rodada}/3" in ambiente.log()
+
+    duracao = await ambiente.rodada()
+    _relatar("chamado envenenado, 4ª rodada", duracao)
+
+    assert ambiente.foi_liberado_pra_tecnico(envenenado)
+    nota = ambiente.ultima_mensagem_da_ia(envenenado)
+    assert "Triagem automática interrompida" in nota
+    avisos = chamados_module._estado_poller_para_json()["avisos"]
+    assert len(avisos) == 1 and f"#{envenenado}" in avisos[0]
+    assert duracao < 3  # não tentou a análise de novo

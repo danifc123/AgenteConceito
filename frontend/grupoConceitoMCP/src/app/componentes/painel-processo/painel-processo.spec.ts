@@ -49,6 +49,25 @@ describe('PainelProcesso', () => {
     expect(fixture.nativeElement.querySelector('.aviso-erro')?.textContent).toContain('GLPI fora do ar');
   });
 
+  it('mostra os chamados encaminhados sem triagem', () => {
+    const fixture = TestBed.createComponent(PainelProcesso);
+    fixture.componentRef.setInput('aberto', true);
+    fixture.componentRef.setInput('avisos', ['Chamado #3360 — Erro: encaminhado direto para Ana']);
+    fixture.detectChanges();
+
+    const aviso = fixture.nativeElement.querySelector('.aviso-atencao');
+    expect(aviso?.textContent).toContain('Encaminhados sem triagem da IA');
+    expect(aviso?.textContent).toContain('#3360');
+  });
+
+  it('sem avisos não mostra a caixa', () => {
+    const fixture = TestBed.createComponent(PainelProcesso);
+    fixture.componentRef.setInput('aberto', true);
+    fixture.detectChanges();
+
+    expect(fixture.nativeElement.querySelector('.aviso-atencao')).toBeNull();
+  });
+
   it('conta regressiva até a próxima rodada e atualiza sozinha a cada segundo', () => {
     vi.useFakeTimers();
     const agora = new Date('2026-10-01T12:00:00Z');

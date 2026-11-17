@@ -334,6 +334,31 @@
   flex-shrink: 0;
 }
 
+.aviso-atencao {
+  margin: 0 22px 12px;
+  padding: 10px 14px;
+  border-radius: var(--radius-sm);
+  background: var(--color-warning-soft);
+  color: var(--color-warning);
+  font: var(--type-caption);
+  flex-shrink: 0;
+  max-height: 160px;
+  overflow-y: auto;
+}
+
+.aviso-atencao-titulo {
+  margin: 0 0 4px;
+  font-weight: 600;
+}
+
+.aviso-atencao-item {
+  margin: 0 0 4px;
+
+  &:last-child {
+    margin-bottom: 0;
+  }
+}
+
 .rodape-proxima {
   display: flex;
   align-items: center;

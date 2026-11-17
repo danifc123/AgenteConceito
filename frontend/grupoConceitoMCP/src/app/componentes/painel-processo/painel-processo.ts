@@ -39,6 +39,9 @@ export class PainelProcesso {
   ultimaRodadaEm = input<string | null>(null);
   proximaRodadaEm = input<string | null>(null);
   erro = input<string | null>(null);
+  /** Avisos que precisam de atenção humana (ex: chamado encaminhado sem
+   * triagem porque a análise travou), mostrados acima do erro. */
+  avisos = input<string[]>([]);
   // Linhas do log ao vivo (`PollerTi.logs`) — cada rótulo de etapa já
   // conta "o quê"; isso aqui é o "quando/pra quem", chamado a chamado,
   // à medida que o backend processa (ver `servicos/poller-ti/poller-ti.ts`).

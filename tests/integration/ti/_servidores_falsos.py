@@ -257,6 +257,8 @@ class EstadoOCI:
     # Chat (endpoint compatível com OpenAI)
     chat_modo: str = "ok"  # "ok" | "travar" | "erro_500" | "erro_429"
     chat_atraso_segundos: float = 0.0
+    # Atraso extra só pra chamados cujo texto contém o marcador (ex: "[lento]").
+    chat_atraso_por_marcador: dict[str, float] = field(default_factory=dict)
     chat_requisicoes: int = 0
     # Embedding (SDK nativo)
     embed_modo: str = "ok"  # "ok" | "travar" | "erro_500"
@@ -309,8 +311,11 @@ def _vetor_falso(texto: str, dimensao: int = 64) -> list[float]:
 
 
 def criar_oci_falsa(estado: EstadoOCI) -> ServidorFalso:
-    async def _comportamento_chat() -> Response | None:
+    async def _comportamento_chat(texto_pedido: str = "") -> Response | None:
         estado.chat_requisicoes += 1
+        for marcador, atraso in estado.chat_atraso_por_marcador.items():
+            if marcador in texto_pedido:
+                await asyncio.sleep(atraso)
         if estado.chat_modo == "travar":
             await asyncio.sleep(_TRAVADO_SEGUNDOS)
         if estado.chat_atraso_segundos:
@@ -323,7 +328,7 @@ def criar_oci_falsa(estado: EstadoOCI) -> ServidorFalso:
 
     async def responses(request: Request):
         corpo = await request.json()
-        erro = await _comportamento_chat()
+        erro = await _comportamento_chat(json.dumps(corpo, ensure_ascii=False))
         if erro is not None:
             return erro
         texto = json.dumps(_decisao_da_ia(corpo["input"]), ensure_ascii=False)
@@ -358,7 +363,7 @@ def criar_oci_falsa(estado: EstadoOCI) -> ServidorFalso:
 
     async def chat_completions(request: Request):
         corpo = await request.json()
-        erro = await _comportamento_chat()
+        erro = await _comportamento_chat(json.dumps(corpo, ensure_ascii=False))
         if erro is not None:
             return erro
         texto = json.dumps(_decisao_da_ia(corpo["messages"]), ensure_ascii=False)
