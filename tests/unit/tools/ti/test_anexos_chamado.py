@@ -139,6 +139,15 @@ class TestExtrairPdf:
         monkeypatch.setattr(mod.pypdf, "PdfReader", _ReaderComMuitasPaginas)
         assert mod._extrair_pdf(b"conteudo") is not None
 
+    def test_para_de_ler_depois_do_maximo_de_paginas(self, monkeypatch):
+        class _ReaderComPaginasDemais:
+            def __init__(self, _stream):
+                self.is_encrypted = False
+                self.pages = [_PaginaFake("p")] * (mod._MAX_PAGINAS_PDF + 10)
+
+        monkeypatch.setattr(mod.pypdf, "PdfReader", _ReaderComPaginasDemais)
+        assert mod._extrair_pdf(b"conteudo").count("p") == mod._MAX_PAGINAS_PDF
+
 
 class TestTruncar:
     def test_nao_trunca_dentro_do_limite(self):
@@ -179,6 +188,10 @@ class TestTextoDoDocumento:
 
     def test_imagem_devolve_none(self):
         assert mod.texto_do_documento("print.png", "image/png", b"bytes-de-imagem") is None
+
+    def test_anexo_acima_do_tamanho_maximo_nem_e_extraido(self, monkeypatch):
+        monkeypatch.setattr(mod, "_TAMANHO_MAXIMO_ANEXO_BYTES", 10)
+        assert mod.texto_do_documento("grande.log", "text/plain", b"x" * 11) is None
 
     def test_pdf_corrompido_devolve_none(self):
         assert mod.texto_do_documento("relatorio.pdf", "application/pdf", b"lixo") is None
@@ -236,6 +249,38 @@ class TestExtrairTextosAnexos:
         cliente = _ClienteFake(documentos=documentos, conteudos={1: None})
 
         assert await mod.extrair_textos_anexos(cliente, 1) == []
+
+    async def test_extracao_que_trava_e_pulada_sem_travar_os_outros(self, monkeypatch):
+        import threading
+
+        liberar = threading.Event()
+        original = mod.texto_do_documento
+
+        def _texto_trava_no_pdf(nome_arquivo, mime, conteudo):
+            if nome_arquivo == "travado.pdf":
+                liberar.wait(5)  # simula pypdf em loop num PDF malformado
+                return None
+            return original(nome_arquivo, mime, conteudo)
+
+        monkeypatch.setattr(mod, "texto_do_documento", _texto_trava_no_pdf)
+        monkeypatch.setattr(mod, "_TIMEOUT_EXTRACAO_SEGUNDOS", 0.05)
+        documentos = [
+            DocumentoAnexo(id=1, nome_arquivo="travado.pdf", mime="application/pdf"),
+            DocumentoAnexo(id=2, nome_arquivo="erro.log", mime="text/plain"),
+        ]
+        cliente = _ClienteFake(
+            documentos,
+            {
+                1: DocumentoBaixado(conteudo=b"%PDF", content_type="application/pdf"),
+                2: DocumentoBaixado(conteudo=b"Erro fatal", content_type="text/plain"),
+            },
+        )
+        try:
+            resultado = await mod.extrair_textos_anexos(cliente, 1)
+        finally:
+            liberar.set()
+
+        assert [texto.nome_arquivo for texto in resultado] == ["erro.log"]
 
     async def test_mais_de_3_anexos_so_le_os_3_primeiros(self):
         documentos = [DocumentoAnexo(id=i, nome_arquivo=f"log{i}.txt", mime="text/plain") for i in range(1, 6)]

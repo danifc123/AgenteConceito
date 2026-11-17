@@ -122,6 +122,17 @@ _logger = logging.getLogger(__name__)
 # não sobrecarregar a API do GLPI/Ollama com verificação constante.
 _INTERVALO_POLLER_SEGUNDOS = 300
 
+# Teto pro processamento de UM chamado (GLPI + avaliação na IA + embedding
+# + anexos). Sem isso, uma única chamada que nunca respondia (IA presa,
+# PDF malformado travando o `pypdf` em loop) segurava o lote inteiro pra
+# sempre: nenhum chamado seguinte era triado e nenhuma rodada nova
+# começava. Folga em cima do pior caso legítimo (chat 2×120s com retry,
+# ver `cliente_protegido.py::_TIMEOUT_OPENAI_COMPATIVEL`, + embedding OCI).
+# Estourou, o chamado é pulado nesta rodada e tentado de novo na próxima —
+# o fluxo já é seguro pra chamado "meio processado" (ver
+# `processar_chamado_novo`).
+_TIMEOUT_POR_CHAMADO_SEGUNDOS = 420
+
 _StatusEtapaPoller = Literal["pendente", "rodando", "concluido", "erro"]
 
 
@@ -578,7 +589,6 @@ async def _executar_uma_rodada() -> None:
     Extraída do `while True` de `iniciar_poller_verificar_chamados` de
     propósito: dá pra testar uma rodada isolada, sem precisar simular um
     loop infinito."""
-    usar_ia = configuracoes_tools.usar_ia_avaliacao_chamado()
     _estado_poller.erro = None
     # Sem isso, a 2ª etapa continuava mostrando "concluído" da RODADA
     # ANTERIOR enquanto a 1ª já estava "rodando" na rodada nova — lido
@@ -589,6 +599,21 @@ async def _executar_uma_rodada() -> None:
         etapa.processados = None
 
     _publicar_log("Rodada iniciada")
+
+    # Postgres síncrono — em thread pra não bloquear o loop de eventos (que
+    # também serve as rotas HTTP), e dentro de `try`: antes ficava solto no
+    # topo da função, e qualquer falha do banco aqui subia até o `while
+    # True` e matava a task do poller em silêncio, até o próximo restart.
+    try:
+        usar_ia = await to_thread.run_sync(configuracoes_tools.usar_ia_avaliacao_chamado)
+    except Exception as erro:
+        _logger.exception("Falha lendo a configuração de IA do poller")
+        _estado_poller.erro = str(erro)
+        for etapa in _estado_poller.etapas:
+            etapa.status = "erro"
+        _publicar_log(f"Falha lendo a configuração (rodada abortada): {erro}")
+        _estado_poller.ultima_rodada_em = datetime.now(UTC)
+        return
 
     _definir_etapa("chamados_novos", "rodando")
     _publicar_log("Verificando chamados novos…")
@@ -635,7 +660,18 @@ async def iniciar_poller_verificar_chamados() -> None:
     if not settings.glpi_base_url:
         return
     while True:
-        await _executar_uma_rodada()
+        # Última rede de proteção: `_executar_uma_rodada` já isola as
+        # falhas esperadas, mas qualquer exceção que escape daqui mataria a
+        # task (criada em `app.py`) sem ninguém ver — o poller parava de
+        # vez e o painel continuava mostrando a última rodada como se nada
+        # tivesse acontecido. `CancelledError` (shutdown) não é `Exception`
+        # e continua passando.
+        try:
+            await _executar_uma_rodada()
+        except Exception as erro:
+            _logger.exception("Falha inesperada na rodada do poller de chamados")
+            _estado_poller.erro = str(erro)
+            _publicar_log(f"Falha inesperada na rodada: {erro}")
         _estado_poller.proxima_rodada_em = datetime.now(UTC) + timedelta(seconds=_INTERVALO_POLLER_SEGUNDOS)
         await asyncio.sleep(_INTERVALO_POLLER_SEGUNDOS)
 
@@ -982,6 +1018,21 @@ def registrar(mcp) -> None:
         return Response(documento.conteudo, media_type=documento.content_type, headers=CORS_HEADERS)
 
 
+def _registrar_timeout_chamado(chamado: Chamado) -> None:
+    """Chamado que estourou `_TIMEOUT_POR_CHAMADO_SEGUNDOS` — loga no
+    servidor E no painel "Ver logs", pra dar pra ver QUAL chamado está
+    segurando a triagem (antes, o lote simplesmente parava sem rastro)."""
+    _logger.error(
+        "Chamado %s passou de %ss sendo processado — pulado nesta rodada",
+        chamado.id,
+        _TIMEOUT_POR_CHAMADO_SEGUNDOS,
+    )
+    _publicar_log(
+        f"Chamado #{chamado.id} — {chamado.titulo}: passou de {_TIMEOUT_POR_CHAMADO_SEGUNDOS}s "
+        "sem resposta (IA/GLPI/anexo), pulado nesta rodada"
+    )
+
+
 async def verificar_chamados_aguardando_resposta(usar_ia: bool) -> int:
     """Segunda perna do poller: chamado `novo` é coberto por
     `verificar_chamados_pendentes`, chamado `aguardando_usuario` é coberto
@@ -1034,15 +1085,21 @@ async def verificar_chamados_aguardando_resposta(usar_ia: bool) -> int:
                 continue
 
             inicio = time.monotonic()
-            resultado = await processar_chamado_novo(
-                _cliente,
-                cliente_ia,
-                modelo_ia_ativo(settings, "ti"),
-                chamado,
-                cargas,
-                usar_ia,
-                embedding_client=embedding_client,
+            resultado = await asyncio.wait_for(
+                processar_chamado_novo(
+                    _cliente,
+                    cliente_ia,
+                    modelo_ia_ativo(settings, "ti"),
+                    chamado,
+                    cargas,
+                    usar_ia,
+                    embedding_client=embedding_client,
+                ),
+                timeout=_TIMEOUT_POR_CHAMADO_SEGUNDOS,
             )
+        except TimeoutError:
+            _registrar_timeout_chamado(chamado)
+            continue
         except Exception:
             _logger.exception("Falha reavaliando resposta nova do chamado %s", chamado.id)
             continue
@@ -1112,15 +1169,21 @@ async def verificar_chamados_pendentes(usar_ia: bool) -> int:
                 chamado_entra_na_amostra, chamado.id, chamado.criado_em
             ):
                 continue
-            resultado = await processar_chamado_novo(
-                _cliente,
-                cliente_ia,
-                modelo_ia_ativo(settings, "ti"),
-                chamado,
-                cargas,
-                usar_ia,
-                embedding_client=embedding_client,
+            resultado = await asyncio.wait_for(
+                processar_chamado_novo(
+                    _cliente,
+                    cliente_ia,
+                    modelo_ia_ativo(settings, "ti"),
+                    chamado,
+                    cargas,
+                    usar_ia,
+                    embedding_client=embedding_client,
+                ),
+                timeout=_TIMEOUT_POR_CHAMADO_SEGUNDOS,
             )
+        except TimeoutError:
+            _registrar_timeout_chamado(chamado)
+            continue
         except Exception:
             _logger.exception("Falha processando o chamado %s", chamado.id)
             continue

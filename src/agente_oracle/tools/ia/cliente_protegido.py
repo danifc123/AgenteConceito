@@ -37,6 +37,7 @@ ser validado pra esse tipo de dado."""
 import logging
 from typing import Protocol
 
+import httpx
 import oci
 from ollama import AsyncClient
 from openai import AsyncOpenAI
@@ -212,6 +213,16 @@ def _provedor_llm_ativo(dominio: DominioIA) -> provedores_llm.ProvedorLLM | None
     return provedores_llm.buscar(id_ativo)
 
 
+# Sem isso o `AsyncOpenAI` usa o padrão do SDK (600s de timeout + 2
+# retries) — uma única chamada presa no endpoint da OCI segurava o poller
+# de triagem por até ~30 min, o que na prática parecia "travado". 120s de
+# leitura já sobra pra um modelo de raciocínio responder uma avaliação de
+# chamado; conexão que nem abre em 10s não vai abrir. 1 retry ainda cobre
+# a instabilidade ocasional de rede sem multiplicar o tempo preso.
+_TIMEOUT_OPENAI_COMPATIVEL = httpx.Timeout(120.0, connect=10.0)
+_MAX_RETRIES_OPENAI_COMPATIVEL = 1
+
+
 def construir_cliente_llm(provedor: ProvedorLLM) -> tuple[object, str]:
     """Dado um `ProvedorLLM` QUALQUER — ativo ou não —, monta o client
     real certo e devolve junto o `host` (só pra log/auditoria). Usado
@@ -227,7 +238,13 @@ def construir_cliente_llm(provedor: ProvedorLLM) -> tuple[object, str]:
         return cliente_real, provedor.base_url
     if provedor.tipo_conexao == "openai_compativel":
         cliente_real = ClienteOpenAICompativel(
-            AsyncOpenAI(base_url=provedor.base_url, api_key=provedor.api_key, project=provedor.projeto_id or None),
+            AsyncOpenAI(
+                base_url=provedor.base_url,
+                api_key=provedor.api_key,
+                project=provedor.projeto_id or None,
+                timeout=_TIMEOUT_OPENAI_COMPATIVEL,
+                max_retries=_MAX_RETRIES_OPENAI_COMPATIVEL,
+            ),
             provedor.estilo_api,
         )
         return cliente_real, provedor.base_url

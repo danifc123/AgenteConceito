@@ -33,6 +33,15 @@ _MAX_ANEXOS_LIDOS = 3
 # sem limitar, um chamado com vários anexos abriria várias sessões
 # simultâneas com a mesma conta de serviço.
 _MAX_DOWNLOADS_SIMULTANEOS = 2
+# Proteções contra anexo que trava a extração (achado investigando o
+# poller de triagem parado): `pypdf` tem casos conhecidos de PDF
+# malformado que fazem `extract_text()` rodar indefinidamente, e thread não
+# dá pra cancelar — então limita ANTES de começar (tamanho/páginas) e não
+# espera mais que `_TIMEOUT_EXTRACAO_SEGUNDOS` pelo resultado (o anexo é
+# só pulado; o chamado segue sendo avaliado sem ele).
+_TAMANHO_MAXIMO_ANEXO_BYTES = 10 * 1024 * 1024
+_MAX_PAGINAS_PDF = 50
+_TIMEOUT_EXTRACAO_SEGUNDOS = 30.0
 _EXTENSOES_TEXTO = (".txt", ".log")
 _EXTENSAO_PDF = ".pdf"
 
@@ -101,7 +110,9 @@ def _extrair_pdf(conteudo: bytes) -> str | None:
             return None
         partes = []
         total = 0
-        for pagina in leitor.pages:
+        for indice, pagina in enumerate(leitor.pages):
+            if indice >= _MAX_PAGINAS_PDF:
+                break
             texto_pagina = pagina.extract_text() or ""
             partes.append(texto_pagina)
             total += len(texto_pagina)
@@ -128,7 +139,7 @@ def texto_do_documento(nome_arquivo: str, mime: str, conteudo: bytes) -> TextoAn
     """Puro, síncrono, nunca levanta — `None` pra tipo não suportado
     (imagem, etc.), conteúdo corrompido, ou vazio depois de extraído."""
     tipo = _tipo_suportado(nome_arquivo, mime)
-    if tipo is None:
+    if tipo is None or len(conteudo) > _TAMANHO_MAXIMO_ANEXO_BYTES:
         return None
     texto_bruto = _extrair_pdf(conteudo) if tipo == "pdf" else _decodificar_texto(conteudo)
     if not texto_bruto:
@@ -164,8 +175,11 @@ async def extrair_textos_anexos(cliente: ClienteGLPI, chamado_id: int) -> list[T
                 baixado = await cliente.baixar_documento(documento.id)
             if baixado is None:
                 return None
-            return await asyncio.to_thread(
-                texto_do_documento, documento.nome_arquivo, documento.mime, baixado.conteudo
+            return await asyncio.wait_for(
+                asyncio.to_thread(
+                    texto_do_documento, documento.nome_arquivo, documento.mime, baixado.conteudo
+                ),
+                timeout=_TIMEOUT_EXTRACAO_SEGUNDOS,
             )
         except Exception:
             return None

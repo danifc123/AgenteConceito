@@ -1035,6 +1035,34 @@ class TestVerificarChamadosPendentes:
         assert {chamado_id for chamado_id, *_ in cliente.atribuicoes} == {2}
         assert resultado == 1  # só o chamado 2 (o que não falhou) conta como processado
 
+    async def test_chamado_que_nao_termina_e_pulado_sem_travar_o_lote(self, monkeypatch):
+        # Reproduz o poller "travado": uma chamada que nunca responde (IA
+        # presa, PDF travando o pypdf) segurava o `for` pra sempre. Com o
+        # teto por chamado, ele é pulado e o próximo da fila é triado.
+        chamado_preso = _chamado(id_=1, categoria_id=999)
+        chamado_ok = _chamado(id_=2, categoria_id=999)
+        cliente = _ClienteGLPIFake([chamado_preso, chamado_ok])
+
+        buscar_followups_original = cliente.buscar_followups
+
+        async def _followups_trava_no_primeiro(chamado_id):
+            if chamado_id == 1:
+                await asyncio.Event().wait()  # nunca termina
+            return await buscar_followups_original(chamado_id)
+
+        cliente.buscar_followups = _followups_trava_no_primeiro
+        monkeypatch.setattr(chamados_module, "_cliente", cliente)
+        monkeypatch.setattr(chamados_module, "_TIMEOUT_POR_CHAMADO_SEGUNDOS", 0.05)
+        monkeypatch.setattr(
+            chamados_module, "criar_cliente_protegido", lambda *_args, **_kwargs: _OllamaClienteFake(suficiente=True)
+        )
+
+        resultado = await asyncio.wait_for(verificar_chamados_pendentes(usar_ia=True), timeout=5)
+
+        assert cliente.avaliacoes == [(2, "fila_atendimento", None)]
+        assert resultado == 1
+        assert any("#1" in linha and "pulado" in linha for linha in chamados_module._historico_log)
+
     async def test_so_processa_os_chamados_que_entram_na_amostra(self, monkeypatch):
         cliente = _ClienteGLPIFake([_chamado(id_=1, categoria_id=999), _chamado(id_=2, categoria_id=999)])
         monkeypatch.setattr(chamados_module, "_cliente", cliente)
@@ -1326,6 +1354,46 @@ class TestExecutarUmaRodada:
         # rodou até o fim apesar da 1ª ter falhado.
         assert etapas_por_id["chamados_aguardando_resposta"]["status"] == "concluido"
         assert estado["erro"] == "GLPI fora do ar"
+
+    async def test_falha_lendo_configuracao_nao_derruba_a_rodada(self, monkeypatch):
+        # Antes, essa leitura (Postgres) ficava fora de qualquer `try` — uma
+        # falha do banco subia até o `while True` e matava o poller.
+        def _banco_fora(*_args, **_kwargs):
+            raise RuntimeError("Postgres fora do ar")
+
+        monkeypatch.setattr(chamados_module.configuracoes_tools, "usar_ia_avaliacao_chamado", _banco_fora)
+
+        await _executar_uma_rodada()
+
+        estado = _estado_poller_para_json()
+        assert estado["erro"] == "Postgres fora do ar"
+        assert all(etapa["status"] == "erro" for etapa in estado["etapas"])
+        assert estado["ultima_rodada_em"] is not None
+
+
+class TestIniciarPoller:
+    async def test_excecao_inesperada_numa_rodada_nao_mata_o_poller(self, monkeypatch):
+        chamados_module._estado_poller = chamados_module.EstadoPoller()
+        rodadas = 0
+
+        async def _rodada_que_quebra_na_primeira():
+            nonlocal rodadas
+            rodadas += 1
+            if rodadas == 1:
+                raise RuntimeError("erro inesperado")
+            if rodadas >= 2:
+                raise asyncio.CancelledError  # encerra o loop infinito do teste
+
+        monkeypatch.setattr(chamados_module.settings, "glpi_base_url", "http://glpi.teste")
+        monkeypatch.setattr(chamados_module, "_executar_uma_rodada", _rodada_que_quebra_na_primeira)
+        monkeypatch.setattr(chamados_module, "_INTERVALO_POLLER_SEGUNDOS", 0)
+
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(chamados_module.iniciar_poller_verificar_chamados(), timeout=5)
+
+        assert rodadas == 2  # sobreviveu à 1ª falha e chegou na 2ª rodada
+        assert chamados_module._estado_poller.erro == "erro inesperado"
+        chamados_module._estado_poller = chamados_module.EstadoPoller()
 
 
 class TestStreamLog:
