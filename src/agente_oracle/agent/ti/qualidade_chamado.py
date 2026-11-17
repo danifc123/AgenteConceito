@@ -34,6 +34,7 @@ from typing import Literal
 
 from agente_oracle.agent.core import OPCOES_OLLAMA_PADRAO, resposta_json_como_dict
 from agente_oracle.tools.ia.cliente_protegido import ClienteChatIA
+from agente_oracle.tools.ia.disjuntor import ProvedorIAIndisponivel, e_erro_de_provedor_inacessivel
 
 # Baixado de 15 pra 5 (decisão do Daniel, 2026-09-24, depois de ver o
 # texto fixo repetindo em chamados de teste bem curtos) — ainda pega
@@ -189,8 +190,15 @@ async def avaliar_chamado(
     categoria: str,
     turnos: Sequence[TurnoConversa] = (),
     usar_ia: bool = True,
+    adiar_se_ia_indisponivel: bool = False,
 ) -> AvaliacaoChamado:
-    """Nunca levanta. `usar_ia=False` pula a IA e usa só a regra de
+    """`adiar_se_ia_indisponivel=True` (o que o poller usa): se o provedor
+    de IA estiver fora (rede, timeout, 5xx, 429 — ver
+    `tools/ia/disjuntor.py`), levanta `ProvedorIAIndisponivel` em vez de
+    cair na regra, pra quem chama deixar o chamado intocado e tentar de
+    novo depois. Qualquer outra falha segue o comportamento abaixo.
+
+    Fora isso, nunca levanta. `usar_ia=False` pula a IA e usa só a regra de
     palavras. Com `usar_ia=True` (padrão), tenta a IA primeiro — toda
     vez que a resposta não for um julgamento confiável (erro na chamada,
     JSON mal formado, tipo errado, ou "insuficiente" sem pergunta) cai na
@@ -209,7 +217,9 @@ async def avaliar_chamado(
             format=_SCHEMA,
             options=OPCOES_OLLAMA_PADRAO,
         )
-    except Exception:
+    except Exception as erro:
+        if adiar_se_ia_indisponivel and e_erro_de_provedor_inacessivel(erro):
+            raise ProvedorIAIndisponivel("IA indisponível ao avaliar o chamado") from erro
         return _avaliar_por_regra(texto_combinado)
 
     corpo = resposta_json_como_dict(resposta.message.content)

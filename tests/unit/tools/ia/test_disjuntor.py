@@ -58,8 +58,20 @@ class TestErroDeProvedorInacessivel:
         except RuntimeError as embrulhado:
             assert e_erro_de_provedor_inacessivel(embrulhado)
 
+    @pytest.mark.parametrize("status", [500, 502, 503, 429])
+    def test_5xx_e_429_contam(self, status):
+        resposta = httpx.Response(status, request=httpx.Request("POST", "http://oci/responses"))
+        erro = openai.APIStatusError("erro", response=resposta, body=None)
+        assert e_erro_de_provedor_inacessivel(erro)
+
+    @pytest.mark.parametrize("status", [400, 401, 404])
+    def test_erro_da_propria_requisicao_nao_conta(self, status):
+        resposta = httpx.Response(status, request=httpx.Request("POST", "http://oci/responses"))
+        erro = openai.APIStatusError("erro", response=resposta, body=None)
+        assert not e_erro_de_provedor_inacessivel(erro)
+
     @pytest.mark.parametrize("erro", [ValueError("json"), RuntimeError("500 Internal Error")])
-    def test_erro_com_resposta_nao_conta(self, erro):
+    def test_erro_sem_status_nao_conta(self, erro):
         assert not e_erro_de_provedor_inacessivel(erro)
 
 
@@ -70,14 +82,16 @@ class TestDisjuntorIA:
         assert await disjuntor.chat(model="m", messages=[]) == "resposta"
         assert await disjuntor.embed(model="m", input="x") == "vetor"
         assert not disjuntor.aberto
+        assert disjuntor.sucessos == 2
 
     async def test_timeout_abre_e_proximas_chamadas_nem_saem(self):
         cliente = _ClienteFake(erro=_timeout_openai())
         avisos = []
         disjuntor = DisjuntorIA(cliente, ao_abrir=lambda operacao, erro: avisos.append(operacao))
 
-        with pytest.raises(openai.APITimeoutError):
+        with pytest.raises(ProvedorIAIndisponivel) as primeira:
             await disjuntor.chat(model="m", messages=[])
+        assert isinstance(primeira.value.__cause__, openai.APITimeoutError)
         with pytest.raises(ProvedorIAIndisponivel):
             await disjuntor.chat(model="m", messages=[])
         with pytest.raises(ProvedorIAIndisponivel):

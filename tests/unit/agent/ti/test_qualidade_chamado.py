@@ -287,3 +287,33 @@ class TestAvaliarChamado:
         assert papeis == ["system", "user", "assistant", "user"]
         assert cliente.mensagens_recebidas[2]["content"] == "Qual sistema está afetado?"
         assert cliente.mensagens_recebidas[3]["content"] == "É o sistema de vendas, trava desde ontem à tarde sempre"
+
+
+class TestAdiarSeIaIndisponivel:
+    _DESCRICAO = "O sistema de vendas trava toda vez que tento emitir o pedido do cliente"
+
+    async def test_ia_fora_do_ar_levanta_em_vez_de_cair_na_regra(self):
+        import httpx
+        import pytest
+
+        from agente_oracle.tools.ia.disjuntor import ProvedorIAIndisponivel
+
+        cliente = _OllamaClientFake(levantar=httpx.ConnectError("recusado"))
+        with pytest.raises(ProvedorIAIndisponivel):
+            await mod.avaliar_chamado(
+                cliente, "m", "titulo", self._DESCRICAO, "categoria", adiar_se_ia_indisponivel=True
+            )
+
+    async def test_sem_a_flag_mantem_o_plano_b_pela_regra(self):
+        import httpx
+
+        cliente = _OllamaClientFake(levantar=httpx.ConnectError("recusado"))
+        avaliacao = await mod.avaliar_chamado(cliente, "m", "titulo", self._DESCRICAO, "categoria")
+        assert avaliacao.origem == "regra"
+
+    async def test_resposta_invalida_continua_caindo_na_regra_mesmo_com_a_flag(self):
+        cliente = _OllamaClientFake(conteudo="isso não é json")
+        avaliacao = await mod.avaliar_chamado(
+            cliente, "m", "titulo", self._DESCRICAO, "categoria", adiar_se_ia_indisponivel=True
+        )
+        assert avaliacao.origem == "regra"

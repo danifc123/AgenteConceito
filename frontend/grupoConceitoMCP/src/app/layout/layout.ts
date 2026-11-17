@@ -4,6 +4,7 @@ import { AuditoriaPainel } from '../componentes/auditoria-painel/auditoria-paine
 import { NotificacaoAnaliseCurriculo } from '../componentes/notificacao-analise-curriculo/notificacao-analise-curriculo';
 import { NotificacaoAuditoria } from '../componentes/notificacao-auditoria/notificacao-auditoria';
 import { NotificacaoChatFinanceiro } from '../componentes/notificacao-chat-financeiro/notificacao-chat-financeiro';
+import { NotificacaoIaIndisponivel } from '../componentes/notificacao-ia-indisponivel/notificacao-ia-indisponivel';
 import { Sidebar } from '../componentes/sidebar/sidebar';
 import { Toast } from '../componentes/toast/toast';
 
@@ -16,6 +17,7 @@ import { Toast } from '../componentes/toast/toast';
     AuditoriaPainel,
     NotificacaoAnaliseCurriculo,
     NotificacaoChatFinanceiro,
+    NotificacaoIaIndisponivel,
     Toast,
   ],
   templateUrl: './layout.html',

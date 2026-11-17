@@ -58,6 +58,7 @@ from starlette.responses import JSONResponse, Response
 from agente_oracle.config import settings
 from agente_oracle.server.ti.chamados import (
     ResultadoProcessamento,
+    _ia_em_modo_regra,
     chamado_entra_na_amostra,
     processar_chamado_novo,
 )
@@ -67,6 +68,7 @@ from agente_oracle.tools.ia.cliente_protegido import (
     criar_cliente_protegido,
     modelo_ia_ativo,
 )
+from agente_oracle.tools.ia.disjuntor import ProvedorIAIndisponivel
 from agente_oracle.tools.ti import configuracoes as configuracoes_tools
 from agente_oracle.tools.ti import uso_ia_chamados
 from agente_oracle.tools.ti.glpi import ClienteGLPI, criar_cliente
@@ -120,7 +122,19 @@ async def processar_webhook(
     try:
         tecnicos = await to_thread.run_sync(todos_os_tecnicos)
         cargas = await cliente.carga_atual_por_tecnico([tecnico.identificador for tecnico in tecnicos])
-        resultado = await processar_chamado_novo(cliente, cliente_ia, modelo, chamado, cargas, usar_ia)
+        # Mesma regra do poller: IA fora do ar → não mexe no chamado (o poller
+        # tenta de novo em até 5 min), a menos que já esteja fora há mais de 1h.
+        resultado = await processar_chamado_novo(
+            cliente,
+            cliente_ia,
+            modelo,
+            chamado,
+            cargas,
+            usar_ia,
+            adiar_se_ia_indisponivel=not _ia_em_modo_regra(),
+        )
+    except ProvedorIAIndisponivel:
+        _logger.warning("IA indisponível no webhook do chamado %s — adiado pro poller", chamado_id)
     except Exception:
         _logger.exception("Falha processando webhook do GLPI pro chamado %s", chamado_id)
 

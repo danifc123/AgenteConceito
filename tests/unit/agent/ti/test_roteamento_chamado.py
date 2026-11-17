@@ -241,3 +241,90 @@ class TestEmbeddingsEmLote:
         assert isinstance(cliente.entradas[0], list)  # tentou o lote primeiro
         assert cliente.entradas[1:] == ["cat infra", "cat sistemas", "cat processos"]
         assert mod._cache_embeddings_categorias[3] == _VETOR_POR_NOME["cat processos"]
+
+
+class _ChatEscolhaFake:
+    def __init__(self, resposta: str | None = None, levantar: Exception | None = None):
+        self._resposta = resposta
+        self._levantar = levantar
+        self.mensagens: list[dict] = []
+
+    async def chat(self, **kwargs):
+        self.mensagens = kwargs["messages"]
+        if self._levantar:
+            raise self._levantar
+        return type("R", (), {"message": type("M", (), {"content": self._resposta})()})()
+
+
+_CATEGORIAS_GRUPOS = (
+    CategoriaGlpi(10, "TI > Sistemas > Power B.I > Dúvida", "sistemas"),
+    CategoriaGlpi(11, "TI > Sistemas > Power B.I > Relatar Erro", "sistemas"),
+    CategoriaGlpi(12, "TI > Sistemas > Power B.I > Permissão de Acesso", "sistemas"),
+    CategoriaGlpi(20, "TI > Infra > Banco de Dados > Permissões", "infra"),
+    CategoriaGlpi(21, "TI > Infra > Banco de Dados > Dúvida", "infra"),
+    CategoriaGlpi(30, "TI > Infra > Impressoras > Relatar problema", "infra"),
+)
+
+
+class TestEscolhaDaCategoriaPelaIA:
+    @pytest.fixture(autouse=True)
+    def _categorias_com_grupos(self, monkeypatch):
+        monkeypatch.setattr(mod.categorias, "CATEGORIAS_ATRIBUIVEIS", _CATEGORIAS_GRUPOS)
+        monkeypatch.setattr(mod.categorias, "AREA_POR_CATEGORIA_ID", {c.id: c.area for c in _CATEGORIAS_GRUPOS})
+        # Embedding favorece Power B.I (texto cita "Power BI"), como no caso real.
+        vetores = {c.nome: [1.0, 0.0] if "Power" in c.nome else [0.6, 0.8] for c in _CATEGORIAS_GRUPOS}
+        self.embed = _OllamaEmbedFake(resolver=lambda texto: vetores.get(texto, [1.0, 0.0]))
+
+    async def test_ia_escolhe_categoria_fora_do_topo_do_embedding(self):
+        chat = _ChatEscolhaFake('{"categoria_id": 20}')
+        resultado = await mod.classificar_categoria(
+            self.embed, "emb", "Acesso a views do banco via Excel", "não é Power BI", 10, True, chat, "chat"
+        )
+        assert resultado.categoria_id == 20
+        assert resultado.area == "infra"
+        opcoes = chat.mensagens[-1]["content"]
+        assert "20: TI > Infra > Banco de Dados > Permissões" in opcoes
+        assert "12: TI > Sistemas > Power B.I > Permissão de Acesso" in opcoes
+
+    async def test_ia_mantendo_a_categoria_atual_nao_corrige(self):
+        chat = _ChatEscolhaFake('{"categoria_id": 10}')
+        resultado = await mod.classificar_categoria(self.embed, "emb", "t", "d", 10, True, chat, "chat")
+        assert resultado.categoria_id is None
+
+    async def test_id_fora_da_lista_cai_no_mais_parecido_pelo_embedding(self):
+        chat = _ChatEscolhaFake('{"categoria_id": 999}')
+        resultado = await mod.classificar_categoria(self.embed, "emb", "t", "d", 30, True, chat, "chat")
+        assert resultado.categoria_id in {10, 11, 12}
+
+    async def test_candidatas_sao_grupos_inteiros_e_incluem_a_atual(self, monkeypatch):
+        monkeypatch.setattr(mod, "_GRUPOS_CANDIDATOS", 1)
+        ranking = list(_CATEGORIAS_GRUPOS)
+        candidatas = mod._candidatas_por_grupo(ranking, categoria_atual_id=30)
+        assert [c.id for c in candidatas] == [10, 11, 12, 30]
+
+    async def test_ia_fora_do_ar_com_flag_levanta(self):
+        import httpx
+
+        from agente_oracle.tools.ia.disjuntor import ProvedorIAIndisponivel
+
+        chat = _ChatEscolhaFake(levantar=httpx.ReadTimeout("lento"))
+        with pytest.raises(ProvedorIAIndisponivel):
+            await mod.classificar_categoria(
+                self.embed, "emb", "t", "d", 10, True, chat, "chat", adiar_se_ia_indisponivel=True
+            )
+
+    async def test_embedding_fora_do_ar_com_flag_levanta(self):
+        import httpx
+
+        from agente_oracle.tools.ia.disjuntor import ProvedorIAIndisponivel
+
+        embed = _OllamaEmbedFake(levantar=httpx.ConnectError("recusado"))
+        with pytest.raises(ProvedorIAIndisponivel):
+            await mod.classificar_categoria(embed, "emb", "t", "d", 10, True, adiar_se_ia_indisponivel=True)
+
+    async def test_ia_fora_do_ar_sem_flag_usa_o_embedding(self):
+        import httpx
+
+        chat = _ChatEscolhaFake(levantar=httpx.ReadTimeout("lento"))
+        resultado = await mod.classificar_categoria(self.embed, "emb", "t", "d", 30, True, chat, "chat")
+        assert resultado.categoria_id in {10, 11, 12}

@@ -1,0 +1,83 @@
+<div class="pilha-ia" role="status" aria-live="polite">
+  @if (visivel() && ia(); as ia) {
+    <div class="toast toast--erro" data-testid="popup-ia-indisponivel">
+      <span class="toast-icone" aria-hidden="true">!</span>
+      <div class="toast-texto">
+        @if (ia.modo_regra) {
+          <p class="toast-titulo">
+            IA da triagem fora do ar há mais de {{ ia.limite_minutos }} min
+          </p>
+          <p class="toast-descricao">
+            A OCI não responde desde {{ desdeFormatado() }}. Para a fila não parar, a triagem passou
+            a decidir pela regra simples (contagem de palavras) até a IA voltar. Confira os chamados
+            triados nesse período.
+          </p>
+        } @else {
+          <p class="toast-titulo">IA da triagem fora do ar</p>
+          <p class="toast-descricao">
+            A OCI não responde desde {{ desdeFormatado() }}. Os chamados novos estão sendo adiados e
+            serão triados automaticamente quando ela voltar. Se continuar fora por
+            {{ ia.limite_minutos }} min, a triagem passa a usar a regra simples.
+          </p>
+        }
+        @if (ia.erro) {
+          <p class="toast-detalhe">{{ ia.erro }}</p>
+        }
+      </div>
+      <div class="toast-acoes">
+        <button
+          type="button"
+          class="toast-fechar"
+          (click)="dispensar()"
+          aria-label="Dispensar aviso"
+          title="Dispensar"
+        >
+          <svg
+            viewBox="0 0 24 24"
+            width="12"
+            height="12"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="3"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          >
+            <path d="M18 6 6 18M6 6l12 12" />
+          </svg>
+        </button>
+      </div>
+    </div>
+  } @else if (mostrarRetorno()) {
+    <div class="toast" data-testid="popup-ia-voltou">
+      <span class="toast-icone" aria-hidden="true">✓</span>
+      <div class="toast-texto">
+        <p class="toast-titulo">IA da triagem voltou</p>
+        <p class="toast-descricao">
+          A OCI voltou a responder e os chamados adiados serão triados na próxima rodada.
+        </p>
+      </div>
+      <div class="toast-acoes">
+        <button
+          type="button"
+          class="toast-fechar"
+          (click)="fecharRetorno()"
+          aria-label="Dispensar aviso"
+          title="Dispensar"
+        >
+          <svg
+            viewBox="0 0 24 24"
+            width="12"
+            height="12"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="3"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          >
+            <path d="M18 6 6 18M6 6l12 12" />
+          </svg>
+        </button>
+      </div>
+    </div>
+  }
+</div>

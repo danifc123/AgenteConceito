@@ -25,8 +25,10 @@ chamado) é gerado a cada chamada real."""
 import math
 from dataclasses import dataclass
 
+from agente_oracle.agent.core import OPCOES_OLLAMA_PADRAO, resposta_json_como_dict
 from agente_oracle.tools.ia.cliente_openai_compativel import EmbeddingNaoSuportado
-from agente_oracle.tools.ia.cliente_protegido import ClienteEmbedIA
+from agente_oracle.tools.ia.cliente_protegido import ClienteChatIA, ClienteEmbedIA
+from agente_oracle.tools.ia.disjuntor import ProvedorIAIndisponivel, e_erro_de_provedor_inacessivel
 from agente_oracle.tools.ti import categorias
 from agente_oracle.tools.ti.categorias import CategoriaGlpi
 from agente_oracle.tools.ti.glpi import AreaChamado
@@ -36,6 +38,24 @@ _AREA_PADRAO: AreaChamado = "sistemas"
 _cache_embeddings_categorias: dict[int, list[float]] | None = None
 # Limite de textos por chamada do `embedText` da OCI.
 _TAMANHO_LOTE_EMBEDDING = 96
+
+# Quantos grupos de categoria (mais parecidos pelo embedding) a IA de chat
+# recebe pra escolher — ver `_candidatas_por_grupo`.
+_GRUPOS_CANDIDATOS = 5
+_MAX_CARACTERES_DESCRICAO_CLASSIFICACAO = 4000
+_SCHEMA_ESCOLHA_CATEGORIA = {
+    "type": "object",
+    "properties": {"categoria_id": {"type": "integer"}},
+    "required": ["categoria_id"],
+}
+_PROMPT_ESCOLHA_CATEGORIA = (
+    "Você classifica chamados de TI de uma empresa no catálogo de categorias do GLPI. "
+    "Leia o título e a descrição e escolha, entre as categorias possíveis listadas, a que "
+    "descreve O QUE o solicitante está pedindo: a ação (criar/liberar acesso, relatar erro, "
+    "dúvida, melhoria…) e o sistema ou recurso que é o ALVO do pedido. Ignore sistemas citados "
+    "só como comparação, contexto ou justificativa. Use apenas um id da lista. "
+    'Responda só com JSON no formato {"categoria_id": <id>}.'
+)
 
 
 @dataclass(frozen=True)
@@ -62,10 +82,27 @@ async def classificar_categoria(
     descricao: str,
     categoria_atual_id: int | None,
     usar_ia: bool,
+    cliente_chat: ClienteChatIA | None = None,
+    modelo_chat: str = "",
+    adiar_se_ia_indisponivel: bool = False,
 ) -> ResultadoClassificacao:
     """`usar_ia=False` nunca chama o provedor de IA — mantém a categoria
     atual e usa a área que já dava pra resolver dela (ou `_AREA_PADRAO` se
-    a categoria atual for desconhecida/vazia)."""
+    a categoria atual for desconhecida/vazia).
+
+    Com `cliente_chat`, a escolha final é do modelo de chat (ver
+    `_escolher_com_ia`): o embedding só pré-seleciona os
+    `_GRUPOS_CANDIDATOS` grupos de categoria mais parecidos com o chamado,
+    e a IA lê o chamado inteiro e escolhe entre todas as categorias desses
+    grupos. Sem isso, o embedding sozinho comparava o texto só com o NOME
+    das categorias, e um sistema citado de passagem puxava a categoria
+    errada (caso real: pedido de acesso de leitura a views do banco via
+    Excel que cita "Power BI" como comparação foi parar em "Power B.I >
+    Dúvida"). Resposta inválida da IA cai na mais parecida pelo embedding.
+
+    `adiar_se_ia_indisponivel=True`: provedor fora do ar (embedding ou
+    chat) levanta `ProvedorIAIndisponivel`, pra quem chama não mexer no
+    chamado e tentar depois (ver `qualidade_chamado.avaliar_chamado`)."""
     area_atual = categorias.AREA_POR_CATEGORIA_ID.get(categoria_atual_id) if categoria_atual_id else None
 
     if not usar_ia:
@@ -74,7 +111,7 @@ async def classificar_categoria(
         )
 
     try:
-        escolhida = await _melhor_categoria(cliente_ia, modelo_embedding, titulo, descricao)
+        ranking = await _categorias_por_similaridade(cliente_ia, modelo_embedding, titulo, descricao)
     except EmbeddingNaoSuportado:
         return ResultadoClassificacao(
             area=area_atual or _AREA_PADRAO,
@@ -82,10 +119,24 @@ async def classificar_categoria(
             precisou_embedding=True,
             embedding_indisponivel=True,
         )
-    except Exception:
+    except Exception as erro:
+        if adiar_se_ia_indisponivel and e_erro_de_provedor_inacessivel(erro):
+            raise ProvedorIAIndisponivel("IA indisponível ao classificar a categoria") from erro
         return ResultadoClassificacao(
             area=area_atual or _AREA_PADRAO, categoria_id=None, precisou_embedding=True
         )
+
+    escolhida = ranking[0]
+    if cliente_chat is not None:
+        candidatas = _candidatas_por_grupo(ranking, categoria_atual_id)
+        try:
+            escolhida_pela_ia = await _escolher_com_ia(cliente_chat, modelo_chat, titulo, descricao, candidatas)
+        except Exception as erro:
+            if adiar_se_ia_indisponivel and e_erro_de_provedor_inacessivel(erro):
+                raise ProvedorIAIndisponivel("IA indisponível ao escolher a categoria") from erro
+            escolhida_pela_ia = None
+        if escolhida_pela_ia is not None:
+            escolhida = escolhida_pela_ia
 
     # Compara pela categoria exata, não só pela área: usuário pode ter
     # escolhido manualmente uma categoria errada que por coincidência já
@@ -99,6 +150,64 @@ async def classificar_categoria(
     return ResultadoClassificacao(area=escolhida.area, categoria_id=escolhida.id, precisou_embedding=True)
 
 
+def _grupo(categoria: CategoriaGlpi) -> str:
+    """Caminho sem a última parte: "TI > Sistemas de Negócio > Power B.I"."""
+    return categoria.nome.rsplit(" > ", 1)[0]
+
+
+def _candidatas_por_grupo(ranking: list[CategoriaGlpi], categoria_atual_id: int | None) -> list[CategoriaGlpi]:
+    """Todas as categorias dos `_GRUPOS_CANDIDATOS` grupos mais parecidos
+    (não só as 5 folhas mais parecidas): as folhas de um mesmo grupo têm
+    nomes quase iguais ("Power B.I > Dúvida", "Power B.I > Relatar Erro"…),
+    e pegar só as 5 primeiras podia trazer 5 variações do grupo errado,
+    sem nenhuma opção certa pra IA escolher. A categoria atual do chamado
+    sempre entra, pra IA poder mantê-la."""
+    grupos: list[str] = []
+    for categoria in ranking:
+        if _grupo(categoria) not in grupos:
+            grupos.append(_grupo(categoria))
+        if len(grupos) == _GRUPOS_CANDIDATOS:
+            break
+    candidatas = [categoria for categoria in ranking if _grupo(categoria) in grupos]
+    atual = next((c for c in ranking if c.id == categoria_atual_id), None)
+    if atual is not None and atual not in candidatas:
+        candidatas.append(atual)
+    return candidatas
+
+
+async def _escolher_com_ia(
+    cliente_chat: ClienteChatIA,
+    modelo: str,
+    titulo: str,
+    descricao: str,
+    candidatas: list[CategoriaGlpi],
+) -> CategoriaGlpi | None:
+    """`None` se a IA devolver algo fora da lista (quem chama usa o
+    embedding). Exceção da chamada sobe pra quem chama decidir."""
+    opcoes = "\n".join(f"- {categoria.id}: {categoria.nome}" for categoria in candidatas)
+    resposta = await cliente_chat.chat(
+        model=modelo,
+        messages=[
+            {"role": "system", "content": _PROMPT_ESCOLHA_CATEGORIA},
+            {
+                "role": "user",
+                "content": (
+                    f"Título: {titulo}\n"
+                    f"Descrição: {descricao[:_MAX_CARACTERES_DESCRICAO_CLASSIFICACAO]}\n\n"
+                    f"Categorias possíveis (id: caminho):\n{opcoes}"
+                ),
+            },
+        ],
+        format=_SCHEMA_ESCOLHA_CATEGORIA,
+        options=OPCOES_OLLAMA_PADRAO,
+    )
+    corpo = resposta_json_como_dict(resposta.message.content)
+    categoria_id = corpo.get("categoria_id")
+    if isinstance(categoria_id, str) and categoria_id.strip().isdigit():
+        categoria_id = int(categoria_id)
+    return next((c for c in candidatas if c.id == categoria_id), None)
+
+
 async def aquecer_embeddings_categorias(cliente_ia: ClienteEmbedIA, modelo_embedding: str) -> None:
     """Gera (uma vez por processo) o embedding de todas as categorias
     atribuíveis. O poller chama isso ANTES do lote, fora do limite de
@@ -109,20 +218,18 @@ async def aquecer_embeddings_categorias(cliente_ia: ClienteEmbedIA, modelo_embed
     await _embeddings_categorias_cacheados(cliente_ia, modelo_embedding)
 
 
-async def _melhor_categoria(
+async def _categorias_por_similaridade(
     cliente_ia: ClienteEmbedIA, modelo_embedding: str, titulo: str, descricao: str
-) -> CategoriaGlpi:
+) -> list[CategoriaGlpi]:
+    """Todas as categorias atribuíveis, da mais parecida com o chamado pra
+    menos parecida (similaridade de cosseno dos embeddings)."""
     embeddings_categorias = await _embeddings_categorias_cacheados(cliente_ia, modelo_embedding)
     embedding_chamado = await _gerar_embedding(cliente_ia, modelo_embedding, f"{titulo}\n{descricao}")
-
-    melhor = categorias.CATEGORIAS_ATRIBUIVEIS[0]
-    melhor_similaridade = -2.0  # abaixo do mínimo possível (-1.0), garante que a 1a categoria sempre entra
-    for categoria in categorias.CATEGORIAS_ATRIBUIVEIS:
-        similaridade = _similaridade_cosseno(embedding_chamado, embeddings_categorias[categoria.id])
-        if similaridade > melhor_similaridade:
-            melhor_similaridade = similaridade
-            melhor = categoria
-    return melhor
+    return sorted(
+        categorias.CATEGORIAS_ATRIBUIVEIS,
+        key=lambda categoria: _similaridade_cosseno(embedding_chamado, embeddings_categorias[categoria.id]),
+        reverse=True,
+    )
 
 
 async def _embeddings_categorias_cacheados(

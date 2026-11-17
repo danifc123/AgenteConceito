@@ -2,7 +2,7 @@ import asyncio
 import contextlib
 import json
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import psycopg
 import pytest
@@ -60,6 +60,20 @@ def _roster_de_tecnicos_para_teste(monkeypatch):
         {"usuario": "278", "nome": "Técnico Processos", "tecnico_glpi_id": "278", "area_ti": "processos"},
     ]
     monkeypatch.setattr("agente_oracle.tools.ti.tecnicos.listar_tecnicos_ti", lambda: roster)
+
+
+@pytest.fixture(autouse=True)
+def _embedding_fake_por_padrao(monkeypatch):
+    # Sem isso as pernas do poller criavam o cliente de embedding REAL
+    # (Ollama local), que falhava por conexão recusada — antes isso só
+    # mantinha a categoria em silêncio; agora conta como IA fora do ar e o
+    # chamado é adiado. Teste que quer o embedding fora do ar sobrescreve.
+    monkeypatch.setattr(
+        chamados_module, "criar_cliente_embedding_protegido", lambda *_args, **_kwargs: _OllamaClienteFake()
+    )
+    chamados_module._estado_poller = chamados_module.EstadoPoller()
+    yield
+    chamados_module._estado_poller = chamados_module.EstadoPoller()
 
 
 @pytest.fixture(autouse=True)
@@ -147,9 +161,16 @@ class _OllamaClienteFake:
         self._mensagem = mensagem
         self._levantar_no_embed = levantar_no_embed
         self.chamadas_chat: list[dict] = []
+        self.chamadas_escolha_categoria: list[dict] = []
         self.chamadas_embed: list[dict] = []
+        # Resposta da escolha de categoria (`roteamento_chamado._escolher_com_ia`);
+        # `None` devolve um id fora da lista (cai no embedding).
+        self.categoria_escolhida: int | None = None
 
     async def chat(self, **kwargs):
+        if "categoria_id" in (kwargs.get("format") or {}).get("properties", {}):
+            self.chamadas_escolha_categoria.append(kwargs)
+            return _RespostaChatFake(json.dumps({"categoria_id": self.categoria_escolhida}))
         self.chamadas_chat.append(kwargs)
         # `pergunta`/`exemplo` é o schema real (ver `qualidade_chamado.py`)
         # — `self._mensagem` vira `pergunta` sozinha, sem exemplo separado,
@@ -1369,6 +1390,81 @@ class TestExecutarUmaRodada:
         assert estado["erro"] == "Postgres fora do ar"
         assert all(etapa["status"] == "erro" for etapa in estado["etapas"])
         assert estado["ultima_rodada_em"] is not None
+
+
+class _ChatForaDoAr(_OllamaClienteFake):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.tentativas = 0
+
+    async def chat(self, **kwargs):
+        import httpx
+
+        self.tentativas += 1
+        raise httpx.ConnectError("recusado")
+
+
+class TestIaForaDoAr:
+    """Regra de negócio: IA fora do ar adia o chamado (não libera, não
+    escala, não comenta); depois de 1h seguida, volta a usar a regra."""
+
+    @pytest.fixture
+    def cenario(self, monkeypatch):
+        chamado = _chamado(id_=1, categoria_id=999)
+        cliente = _ClienteGLPIFake([chamado, _chamado(id_=2, categoria_id=999)])
+        chat = _ChatForaDoAr()
+        monkeypatch.setattr(chamados_module, "_cliente", cliente)
+        monkeypatch.setattr(chamados_module, "criar_cliente_protegido", lambda *_a, **_k: chat)
+        monkeypatch.setattr(chamados_module.configuracoes_tools, "usar_ia_avaliacao_chamado", lambda: True)
+        monkeypatch.setattr(chamados_module.uso_ia_chamados, "ultima_avaliacao", lambda _id: None)
+        return cliente, chat
+
+    async def test_chamados_sao_adiados_intocados_e_estado_ia_fica_marcado(self, cenario):
+        cliente, chat = cenario
+
+        await _executar_uma_rodada()
+
+        assert cliente.avaliacoes == []
+        assert cliente.atribuicoes == []
+        assert chat.tentativas == 1  # o 2º chamado nem tenta: disjuntor aberto
+        estado = _estado_poller_para_json()
+        assert estado["ia"]["indisponivel_desde"] is not None
+        assert estado["ia"]["modo_regra"] is False
+        assert "ConnectError" in estado["ia"]["erro"]
+        assert any("2 chamado(s) adiado(s)" in linha for linha in chamados_module._historico_log)
+
+    async def test_depois_de_1h_fora_volta_a_decidir_pela_regra(self, cenario):
+        cliente, _chat = cenario
+        chamados_module._estado_poller.ia_indisponivel_desde = datetime.now(UTC) - timedelta(minutes=61)
+
+        await _executar_uma_rodada()
+
+        assert {chamado_id for chamado_id, *_ in cliente.avaliacoes} == {1, 2}
+        assert _estado_poller_para_json()["ia"]["modo_regra"] is True
+
+    async def test_ia_voltando_limpa_o_estado(self, cenario, monkeypatch):
+        cliente, _chat = cenario
+        chamados_module._estado_poller.ia_indisponivel_desde = datetime.now(UTC) - timedelta(minutes=10)
+        monkeypatch.setattr(
+            chamados_module, "criar_cliente_protegido", lambda *_a, **_k: _OllamaClienteFake(suficiente=True)
+        )
+
+        await _executar_uma_rodada()
+
+        assert {chamado_id for chamado_id, *_ in cliente.avaliacoes} == {1, 2}
+        estado = _estado_poller_para_json()
+        assert estado["ia"]["indisponivel_desde"] is None
+        assert estado["ia"]["erro"] is None
+
+    async def test_fila_vazia_nao_muda_o_estado(self, cenario, monkeypatch):
+        desde = datetime.now(UTC) - timedelta(minutes=10)
+        chamados_module._estado_poller.ia_indisponivel_desde = desde
+        monkeypatch.setattr(chamados_module, "_cliente", _ClienteGLPIFake([]))
+        monkeypatch.setattr(roteamento_chamado, "_cache_embeddings_categorias", {999: [1.0, 0.0]})
+
+        await _executar_uma_rodada()
+
+        assert chamados_module._estado_poller.ia_indisponivel_desde == desde
 
 
 class TestIniciarPoller:

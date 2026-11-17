@@ -265,7 +265,25 @@ class EstadoOCI:
     embed_assinadas: int = 0  # requisições que chegaram com assinatura RSA da OCI
 
 
+def _escolha_de_categoria(mensagens: list[dict]) -> dict | None:
+    """Pedido de escolha de categoria (`roteamento_chamado._escolher_com_ia`):
+    "IA" que sabe que pedido de acesso a views do banco é permissão de banco
+    de dados — se essa opção estiver entre as candidatas; senão, a 1ª."""
+    texto = mensagens[-1].get("content", "") if mensagens else ""
+    if "Categorias possíveis" not in texto:
+        return None
+    opcoes = re.findall(r"^- (\d+): (.+)$", texto, flags=re.MULTILINE)
+    if "views" in texto.lower():
+        for categoria_id, nome in opcoes:
+            if nome.endswith("Banco de Dados > Permissões"):
+                return {"categoria_id": int(categoria_id)}
+    return {"categoria_id": int(opcoes[0][0])}
+
+
 def _decisao_da_ia(mensagens: list[dict]) -> dict:
+    escolha = _escolha_de_categoria(mensagens)
+    if escolha is not None:
+        return escolha
     """ "Julgamento" determinístico: título com `[vago]` e nenhuma resposta
     do solicitante ainda → pede mais informação; senão, suficiente."""
     primeira_do_usuario = next((m for m in mensagens if m.get("role") == "user"), {})

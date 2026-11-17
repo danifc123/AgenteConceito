@@ -227,3 +227,18 @@ class TestProcessarWebhook:
         assert status_code == 200
         assert resultado is not None
         assert resultado.avaliacao_suficiente is True
+
+    async def test_ia_fora_do_ar_nao_mexe_no_chamado(self):
+        import httpx
+
+        class _ChatForaDoAr(_OllamaClienteFake):
+            async def chat(self, **_kwargs):
+                raise httpx.ConnectError("recusado")
+
+        cliente = _ClienteGLPIFake([_chamado(1, categoria_id=1)])
+        status_code, _corpo, resultado = await processar_webhook({"id": 1}, cliente, _ChatForaDoAr(), "m", True)
+
+        assert status_code == 200
+        assert resultado is None
+        assert cliente.atribuicoes == []
+        assert (await cliente.buscar(1)).status == "novo"  # intocado

@@ -104,7 +104,7 @@ from agente_oracle.tools.ia.cliente_protegido import (
     modelo_embedding_ativo,
     modelo_ia_ativo,
 )
-from agente_oracle.tools.ia.disjuntor import DisjuntorIA
+from agente_oracle.tools.ia.disjuntor import DisjuntorIA, ProvedorIAIndisponivel
 from agente_oracle.tools.ti import amostragem_chamados, anexos_chamado, categorias, uso_ia_chamados
 from agente_oracle.tools.ti import configuracoes as configuracoes_tools
 from agente_oracle.tools.ti.glpi import (
@@ -141,6 +141,15 @@ _TIMEOUT_POR_CHAMADO_SEGUNDOS = 420
 # categoria (categoria atual mantida) e tenta de novo na próxima.
 _TIMEOUT_AQUECIMENTO_EMBEDDINGS_SEGUNDOS = 600
 
+# Regra de negócio (decisão do Daniel, 2026-11): com a IA fora do ar, o
+# chamado é ADIADO (fica intocado e a IA tenta de novo na próxima rodada),
+# nunca liberado/escalado só porque a IA não respondeu. Se a IA continuar
+# fora por mais que isso, a triagem volta a decidir pela regra simples
+# (contagem de palavras) até ela voltar, pra fila não parar de vez. O
+# frontend mostra um popup enquanto a IA estiver fora (ver `ia` em
+# `_estado_poller_para_json`).
+_LIMITE_IA_FORA_ANTES_DA_REGRA = timedelta(hours=1)
+
 _StatusEtapaPoller = Literal["pendente", "rodando", "concluido", "erro"]
 
 
@@ -172,9 +181,33 @@ class EstadoPoller:
     ultima_rodada_em: datetime | None = None
     proxima_rodada_em: datetime | None = None
     erro: str | None = None
+    # Desde quando o provedor de IA está fora (`None` = respondendo). Este
+    # campo, diferente dos outros, DECIDE fluxo: ver `_ia_em_modo_regra`.
+    ia_indisponivel_desde: datetime | None = None
+    ia_erro: str | None = None
 
 
 _estado_poller = EstadoPoller()
+
+
+def _ia_em_modo_regra(agora: datetime | None = None) -> bool:
+    desde = _estado_poller.ia_indisponivel_desde
+    return desde is not None and (agora or datetime.now(UTC)) - desde >= _LIMITE_IA_FORA_ANTES_DA_REGRA
+
+
+def _atualizar_estado_ia(*clientes: "DisjuntorIA") -> None:
+    """Depois de uma perna do poller: algum disjuntor abriu → IA fora
+    (guarda desde quando, só na 1ª vez); nenhum abriu e alguma chamada deu
+    certo → IA de volta. Sem nenhuma chamada (fila vazia) não muda nada."""
+    if any(cliente.aberto for cliente in clientes):
+        if _estado_poller.ia_indisponivel_desde is None:
+            _estado_poller.ia_indisponivel_desde = datetime.now(UTC)
+            _publicar_log("IA fora do ar — chamados serão adiados até ela voltar")
+        _estado_poller.ia_erro = next((c.ultimo_erro for c in clientes if c.ultimo_erro), None)
+    elif any(cliente.sucessos for cliente in clientes) and _estado_poller.ia_indisponivel_desde is not None:
+        _estado_poller.ia_indisponivel_desde = None
+        _estado_poller.ia_erro = None
+        _publicar_log("IA voltou a responder — triagem normal retomada")
 
 
 def _definir_etapa(etapa_id: str, status: _StatusEtapaPoller, processados: int | None = None) -> None:
@@ -198,6 +231,14 @@ def _estado_poller_para_json() -> dict:
         if _estado_poller.proxima_rodada_em
         else None,
         "erro": _estado_poller.erro,
+        "ia": {
+            "indisponivel_desde": _estado_poller.ia_indisponivel_desde.isoformat()
+            if _estado_poller.ia_indisponivel_desde
+            else None,
+            "modo_regra": _ia_em_modo_regra(),
+            "erro": _estado_poller.ia_erro,
+            "limite_minutos": int(_LIMITE_IA_FORA_ANTES_DA_REGRA.total_seconds() // 60),
+        },
     }
 
 
@@ -632,6 +673,13 @@ async def _executar_uma_rodada() -> None:
     except Exception:
         _logger.exception("Falha preparando os clientes de IA da rodada")
 
+    if usar_ia and _ia_em_modo_regra():
+        _publicar_log(
+            "IA fora do ar há mais de "
+            f"{int(_LIMITE_IA_FORA_ANTES_DA_REGRA.total_seconds() // 60)} min — "
+            "esta rodada decide pela regra simples onde a IA não responder"
+        )
+
     _definir_etapa("chamados_novos", "rodando")
     _publicar_log("Verificando chamados novos…")
     try:
@@ -701,6 +749,7 @@ async def processar_chamado_novo(
     cargas: dict[str, int],
     usar_ia: bool,
     embedding_client: ClienteEmbedIA | None = None,
+    adiar_se_ia_indisponivel: bool = False,
 ) -> ResultadoProcessamento:
     """Avalia se o chamado tem informação suficiente, olhando a conversa
     de esclarecimento inteira (`cliente.buscar_followups`, mapeada pra
@@ -770,12 +819,17 @@ async def processar_chamado_novo(
     `escolher_tecnico`, e um anexo ali quebraria os dois: o embedding
     nativo da OCI manda `truncate="NONE"` (um anexo grande estoura o
     limite e falha a correção de categoria, silenciosamente, caindo no
-    `except Exception` de `_melhor_categoria`), e `escolher_tecnico` casa
+    `except Exception` de `classificar_categoria`), e `escolher_tecnico` casa
     o primeiro nome de cada técnico contra o texto inteiro — um log real
     cheio de nome próprio desviaria a escolha por coincidência. Só busca
     anexo com `usar_ia=True` (com a IA desligada, a avaliação usa só a
     regra de contagem de palavra — anexar texto ali só infla a contagem à
-    toa e gasta chamada no GLPI sem necessidade)."""
+    toa e gasta chamada no GLPI sem necessidade).
+
+    `adiar_se_ia_indisponivel=True`: IA fora do ar levanta
+    `ProvedorIAIndisponivel` ANTES de qualquer escrita no GLPI (avaliação e
+    classificação vêm antes de atribuir/comentar/trocar status), então o
+    chamado fica exatamente como estava pra próxima rodada."""
     descricao_limpa = _texto_para_ia(chamado.descricao)
     followups = await cliente.buscar_followups(chamado.id)
     turnos = _turnos_da_conversa(followups)
@@ -790,6 +844,7 @@ async def processar_chamado_novo(
         chamado.categoria,
         turnos=turnos,
         usar_ia=usar_ia,
+        adiar_se_ia_indisponivel=adiar_se_ia_indisponivel,
     )
     if not avaliacao.suficiente:
         bateu_limite = rodadas_do_usuario >= _LIMITE_RODADAS_ESCLARECIMENTO
@@ -814,6 +869,9 @@ async def processar_chamado_novo(
         descricao_limpa,
         chamado.categoria_id,
         usar_ia,
+        cliente_chat=cliente_ia,
+        modelo_chat=modelo,
+        adiar_se_ia_indisponivel=adiar_se_ia_indisponivel,
     )
     if resultado_classificacao.categoria_id is not None:
         await cliente.atualizar_categoria(chamado.id, resultado_classificacao.categoria_id)
@@ -1035,6 +1093,12 @@ def registrar(mcp) -> None:
         return Response(documento.conteudo, media_type=documento.content_type, headers=CORS_HEADERS)
 
 
+def _registrar_adiados(adiados: list[int]) -> None:
+    if adiados:
+        lista = ", ".join(f"#{chamado_id}" for chamado_id in adiados)
+        _publicar_log(f"{len(adiados)} chamado(s) adiado(s) — IA indisponível, nova tentativa na próxima rodada: {lista}")
+
+
 def _registrar_timeout_chamado(chamado: Chamado) -> None:
     """Chamado que estourou `_TIMEOUT_POR_CHAMADO_SEGUNDOS` — loga no
     servidor E no painel "Ver logs", pra dar pra ver QUAL chamado está
@@ -1054,8 +1118,8 @@ def _avisar_ia_indisponivel(tipo: str) -> Callable[[str, BaseException], None]:
     def _avisar(_operacao: str, erro: BaseException) -> None:
         _logger.warning("Provedor de IA (%s) não respondeu nesta rodada: %r", tipo, erro)
         _publicar_log(
-            f"IA de {tipo} não respondeu ({type(erro).__name__}) — o restante desta rodada segue "
-            "sem ela (plano B), nova tentativa na próxima rodada"
+            f"IA de {tipo} não respondeu ({type(erro).__name__}) — nesta rodada ninguém mais "
+            "espera por ela; nova tentativa na próxima rodada"
         )
 
     return _avisar
@@ -1095,7 +1159,9 @@ async def _preparar_clientes_ia_da_rodada(usar_ia: bool) -> tuple[DisjuntorIA, D
 
 
 async def verificar_chamados_aguardando_resposta(
-    usar_ia: bool, clientes_ia: tuple[DisjuntorIA, DisjuntorIA] | None = None
+    usar_ia: bool,
+    clientes_ia: tuple[DisjuntorIA, DisjuntorIA] | None = None,
+    adiar_se_ia_indisponivel: bool | None = None,
 ) -> int:
     """Segunda perna do poller: chamado `novo` é coberto por
     `verificar_chamados_pendentes`, chamado `aguardando_usuario` é coberto
@@ -1125,6 +1191,9 @@ async def verificar_chamados_aguardando_resposta(
     só pelo poller), atribuir o custo todo a quem clicou "Verificar" seria
     enganoso (ver `tools/ia/cliente_protegido.py::USUARIO_SISTEMA`)."""
     cliente_ia, embedding_client = clientes_ia or await _preparar_clientes_ia_da_rodada(usar_ia)
+    if adiar_se_ia_indisponivel is None:
+        adiar_se_ia_indisponivel = not _ia_em_modo_regra()
+    adiados: list[int] = []
     tecnicos = await to_thread.run_sync(todos_os_tecnicos)
     cargas = await _cliente.carga_atual_por_tecnico([tecnico.identificador for tecnico in tecnicos])
 
@@ -1156,9 +1225,13 @@ async def verificar_chamados_aguardando_resposta(
                     cargas,
                     usar_ia,
                     embedding_client=embedding_client,
+                    adiar_se_ia_indisponivel=adiar_se_ia_indisponivel,
                 ),
                 timeout=_TIMEOUT_POR_CHAMADO_SEGUNDOS,
             )
+        except ProvedorIAIndisponivel:
+            adiados.append(chamado.id)
+            continue
         except TimeoutError:
             _registrar_timeout_chamado(chamado)
             continue
@@ -1176,11 +1249,15 @@ async def verificar_chamados_aguardando_resposta(
         _publicar_log(f"Chamado #{chamado.id} — {chamado.titulo}: {_descricao_acao(resultado)}")
         processados += 1
 
+    _registrar_adiados(adiados)
+    _atualizar_estado_ia(cliente_ia, embedding_client)
     return processados
 
 
 async def verificar_chamados_pendentes(
-    usar_ia: bool, clientes_ia: tuple[DisjuntorIA, DisjuntorIA] | None = None
+    usar_ia: bool,
+    clientes_ia: tuple[DisjuntorIA, DisjuntorIA] | None = None,
+    adiar_se_ia_indisponivel: bool | None = None,
 ) -> int:
     """Roda `processar_chamado_novo` só em chamado `novo` — `listar()`
     também devolve `aguardando_usuario` (é o que a tela mostra), mas
@@ -1218,6 +1295,9 @@ async def verificar_chamados_pendentes(
     `verificar_chamados_aguardando_resposta` — é um lote de vários
     chamados de pessoas diferentes, não a ação de quem disparou."""
     cliente_ia, embedding_client = clientes_ia or await _preparar_clientes_ia_da_rodada(usar_ia)
+    if adiar_se_ia_indisponivel is None:
+        adiar_se_ia_indisponivel = not _ia_em_modo_regra()
+    adiados: list[int] = []
     tecnicos = await to_thread.run_sync(todos_os_tecnicos)
     cargas = await _cliente.carga_atual_por_tecnico([tecnico.identificador for tecnico in tecnicos])
 
@@ -1241,9 +1321,13 @@ async def verificar_chamados_pendentes(
                     cargas,
                     usar_ia,
                     embedding_client=embedding_client,
+                    adiar_se_ia_indisponivel=adiar_se_ia_indisponivel,
                 ),
                 timeout=_TIMEOUT_POR_CHAMADO_SEGUNDOS,
             )
+        except ProvedorIAIndisponivel:
+            adiados.append(chamado.id)
+            continue
         except TimeoutError:
             _registrar_timeout_chamado(chamado)
             continue
@@ -1261,4 +1345,6 @@ async def verificar_chamados_pendentes(
         _publicar_log(f"Chamado #{chamado.id} — {chamado.titulo}: {_descricao_acao(resultado)}")
         processados += 1
 
+    _registrar_adiados(adiados)
+    _atualizar_estado_ia(cliente_ia, embedding_client)
     return processados

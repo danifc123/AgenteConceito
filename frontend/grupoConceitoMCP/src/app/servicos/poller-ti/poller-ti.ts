@@ -9,11 +9,23 @@ import { Subscription } from 'rxjs';
 import { EtapaProcesso } from '../../componentes/painel-processo/painel-processo';
 import { MCP_API_BASE_URL } from '../../app-config';
 
+/** Disponibilidade do provedor de IA da triagem (OCI). Com a IA fora do
+ * ar o backend ADIA os chamados (não mexe neles); depois de
+ * `limite_minutos` seguidos fora, passa a decidir pela regra simples
+ * (`modo_regra`). Alimenta o popup global `app-notificacao-ia-indisponivel`. */
+export interface EstadoIaTriagem {
+  indisponivel_desde: string | null;
+  modo_regra: boolean;
+  erro: string | null;
+  limite_minutos: number;
+}
+
 interface RespostaStatusPoller {
   etapas: EtapaProcesso[];
   ultima_rodada_em: string | null;
   proxima_rodada_em: string | null;
   erro: string | null;
+  ia?: EstadoIaTriagem;
 }
 
 const LIMITE_LINHAS_LOG = 200;
@@ -29,6 +41,7 @@ export class PollerTi {
   readonly ultimaRodadaEm = signal<string | null>(null);
   readonly proximaRodadaEm = signal<string | null>(null);
   readonly erro = signal<string | null>(null);
+  readonly ia = signal<EstadoIaTriagem | null>(null);
   readonly logs = signal<string[]>([]);
 
   private assinaturaLogs: Subscription | null = null;
@@ -40,6 +53,7 @@ export class PollerTi {
         this.ultimaRodadaEm.set(resposta.ultima_rodada_em);
         this.proximaRodadaEm.set(resposta.proxima_rodada_em);
         this.erro.set(resposta.erro);
+        this.ia.set(resposta.ia ?? null);
       },
     });
   }

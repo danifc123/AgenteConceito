@@ -15,7 +15,7 @@ imprime quanto a rodada levou (`-s` pra ver)."""
 
 import asyncio
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import httpx
@@ -125,6 +125,14 @@ class Ambiente:
             self.glpi.status(ticket_id) == 2
             and _CONTA_IA_ID not in atribuidos
             and any(a in _IDS_TECNICOS for a in atribuidos)
+        )
+
+    def esta_intocado(self, ticket_id: int) -> bool:
+        """Do jeito que chegou: status Novo, ninguém atribuído, sem comentário."""
+        return (
+            self.glpi.status(ticket_id) == 1
+            and self.glpi.atribuidos(ticket_id) == []
+            and self.glpi.followups[ticket_id] == []
         )
 
     def esta_aguardando_usuario(self, ticket_id: int) -> bool:
@@ -283,31 +291,44 @@ async def test_dia_normal_lote_misto_logo_depois_do_deploy(ambiente):
     assert ambiente.oci.embed_requisicoes - requisicoes_embed_antes == 1
 
 
-async def test_oci_chat_travada_nao_segura_o_lote(ambiente):
-    """O cenário dos 30 minutos: a OCI aceita a conexão e nunca responde."""
-    detalhados = [ambiente.chamado(f"Impressora {i} com erro 0x0000011b") for i in range(6)]
-    vago = ambiente.chamado("[vago] impressora", descricao="<p>não imprime</p>")
+async def test_oci_chat_travada_adia_o_lote_sem_mexer_nos_chamados(ambiente):
+    """O cenário dos 30 minutos: a OCI aceita a conexão e nunca responde.
+    Regra de negócio: IA fora → chamado adiado, intocado no GLPI."""
+    chamados = [ambiente.chamado(f"Impressora {i} com erro 0x0000011b") for i in range(6)]
+    chamados.append(ambiente.chamado("[vago] impressora", descricao="<p>a impressora não imprime nada</p>"))
     ambiente.oci.chat_modo = "travar"
 
     duracao = await ambiente.rodada()
-    _relatar(
-        "OCI chat travada (7 chamados)", duracao, f"requisições de chat: {ambiente.oci.chat_requisicoes}"
-    )
+    _relatar("OCI chat travada (7 chamados)", duracao, f"requisições de chat: {ambiente.oci.chat_requisicoes}")
 
-    # Só o 1º chamado espera (1 tentativa + 1 retry de 2s); o resto vai direto pro plano B.
+    # Só o 1º chamado espera (1 tentativa + 1 retry de 2s); o resto é adiado na hora.
     assert ambiente.oci.chat_requisicoes == 2
     assert duracao < 2 * (120 / _ESCALA) + 3
-    assert all(ambiente.foi_liberado_pra_tecnico(t) for t in detalhados)  # regra: descrição detalhada
-    assert ambiente.esta_aguardando_usuario(vago)  # regra: descrição curta demais
-    assert "IA de avaliação não respondeu" in ambiente.log()
-    assert ambiente.etapas()["chamados_novos"]["processados"] == 7
+    assert all(ambiente.esta_intocado(t) for t in chamados)
+    assert "7 chamado(s) adiado(s)" in ambiente.log()
+    estado = chamados_module._estado_poller_para_json()["ia"]
+    assert estado["indisponivel_desde"] is not None and estado["modo_regra"] is False
 
-    # OCI volta: a rodada seguinte usa a IA de novo.
+    # OCI volta: a rodada seguinte tria todo mundo com a IA e limpa o aviso.
     ambiente.oci.chat_modo = "ok"
-    novo = ambiente.chamado("[vago] scanner", descricao="<p>scanner não funciona direito aqui</p>")
     await ambiente.rodada()
-    assert ambiente.esta_aguardando_usuario(novo)
-    assert "Qual mensagem de erro aparece na tela?" in ambiente.ultima_mensagem_da_ia(novo)
+    assert all(ambiente.foi_liberado_pra_tecnico(t) for t in chamados[:6])
+    assert ambiente.esta_aguardando_usuario(chamados[6])
+    assert "Qual mensagem de erro aparece na tela?" in ambiente.ultima_mensagem_da_ia(chamados[6])
+    assert chamados_module._estado_poller_para_json()["ia"]["indisponivel_desde"] is None
+
+
+async def test_oci_fora_por_mais_de_1h_volta_a_decidir_pela_regra(ambiente):
+    chamados = [ambiente.chamado(f"Impressora {i} com erro 0x0000011b") for i in range(3)]
+    ambiente.oci.chat_modo = "travar"
+    chamados_module._estado_poller.ia_indisponivel_desde = datetime.now(UTC) - timedelta(minutes=61)
+
+    duracao = await ambiente.rodada()
+    _relatar("OCI fora há mais de 1h", duracao)
+
+    assert all(ambiente.foi_liberado_pra_tecnico(t) for t in chamados)  # regra: descrição detalhada
+    assert chamados_module._estado_poller_para_json()["ia"]["modo_regra"] is True
+    assert "regra simples" in ambiente.log()
 
 
 async def test_oci_chat_lenta_mas_dentro_do_limite_continua_usando_a_ia(ambiente):
@@ -324,15 +345,16 @@ async def test_oci_chat_lenta_mas_dentro_do_limite_continua_usando_a_ia(ambiente
 
 
 @pytest.mark.parametrize("modo", ["erro_500", "erro_429"])
-async def test_oci_chat_devolvendo_erro_cai_no_plano_b_rapido(ambiente, modo):
-    detalhados = [ambiente.chamado(f"Impressora {i} com erro 0x0000011b") for i in range(4)]
+async def test_oci_chat_devolvendo_erro_adia_rapido(ambiente, modo):
+    chamados = [ambiente.chamado(f"Impressora {i} com erro 0x0000011b") for i in range(4)]
     ambiente.oci.chat_modo = modo
 
     duracao = await ambiente.rodada()
     _relatar(f"OCI chat devolvendo {modo}", duracao)
 
-    assert duracao < 15  # retry curto do SDK por chamado, nada de espera longa
-    assert all(ambiente.foi_liberado_pra_tecnico(t) for t in detalhados)
+    assert duracao < 15
+    assert ambiente.oci.chat_requisicoes == 2  # 1 + 1 retry do SDK, depois o disjuntor corta
+    assert all(ambiente.esta_intocado(t) for t in chamados)
 
 
 async def test_embedding_oci_travado_logo_depois_do_deploy(ambiente):
@@ -345,9 +367,13 @@ async def test_embedding_oci_travado_logo_depois_do_deploy(ambiente):
 
     assert ambiente.oci.embed_requisicoes == 1  # 1ª chamada estoura; o disjuntor corta o resto
     assert duracao < 60 / _ESCALA + 3
-    assert all(ambiente.foi_liberado_pra_tecnico(t) for t in detalhados)
+    assert all(ambiente.esta_intocado(t) for t in detalhados)  # adiados: sem categoria certa não libera
     assert {t: ambiente.glpi.tickets[t]["category"]["id"] for t in detalhados} == categorias_antes
     assert "IA de categoria (embedding) não respondeu" in ambiente.log()
+
+    ambiente.oci.embed_modo = "ok"
+    await ambiente.rodada()
+    assert all(ambiente.foi_liberado_pra_tecnico(t) for t in detalhados)
 
 
 async def test_embedding_lento_mas_dentro_do_limite(ambiente):
@@ -443,3 +469,28 @@ async def test_volume_de_um_dia_cheio(ambiente):
 
     assert all(ambiente.foi_liberado_pra_tecnico(t) for t in chamados)
     assert "pulado" not in ambiente.log()
+
+
+async def test_pedido_de_acesso_ao_banco_que_cita_power_bi_vai_pra_categoria_certa(ambiente):
+    """Caso real: pedido de acesso de leitura a views do banco via Excel,
+    aberto em "Power B.I > Dúvida" porque o texto cita Power BI como
+    comparação. A IA recebe os grupos mais próximos inteiros e escolhe."""
+    power_bi_duvida = next((c.id, c.nome) for c in CATEGORIAS_ATRIBUIVEIS if c.nome.endswith("Power B.I > Dúvida"))
+    chamado = ambiente.chamado(
+        "Solicitação de acesso somente leitura a views do banco via Excel (Power Query)",
+        descricao=(
+            "<p>Solicito a liberação de conexão do Excel (Power Query/ODBC) a views específicas do banco de "
+            "dados, somente leitura (SELECT), com atualização em tempo real. A atualização agendada do Power BI "
+            "não acompanha o ritmo da expedição. Views: Kardex, Detalhamento OP, SFT, Lançamentos Contábeis, "
+            "Margem. Usuários: Driele, Vinicius, Leandro, Dener.</p>"
+        ),
+        categoria=power_bi_duvida,
+    )
+
+    await ambiente.rodada()
+
+    categoria_final = ambiente.glpi.tickets[chamado]["category"]["id"]
+    nome_final = next(c.nome for c in CATEGORIAS_ATRIBUIVEIS if c.id == categoria_final)
+    _relatar("pedido de acesso ao banco citando Power BI", 0, f"categoria final: {nome_final}")
+    assert nome_final.endswith("Banco de Dados > Permissões")
+    assert ambiente.foi_liberado_pra_tecnico(chamado)
