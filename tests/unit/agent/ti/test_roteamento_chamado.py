@@ -28,8 +28,8 @@ def _categorias_fake(monkeypatch):
 
 
 class _EmbedRespostaFake:
-    def __init__(self, embedding: list[float]):
-        self.embeddings = [embedding]
+    def __init__(self, embedding: list[float] | None = None, embeddings: list[list[float]] | None = None):
+        self.embeddings = embeddings if embeddings is not None else [embedding]
 
 
 class _OllamaEmbedFake:
@@ -42,7 +42,10 @@ class _OllamaEmbedFake:
         self.chamadas += 1
         if self._levantar:
             raise self._levantar
-        return _EmbedRespostaFake(self._resolver(kwargs.get("input", "")))
+        entrada = kwargs.get("input", "")
+        if isinstance(entrada, list):  # lote (OCI/Ollama aceitam lista): um vetor por texto
+            return _EmbedRespostaFake(embeddings=[self._resolver(texto) for texto in entrada])
+        return _EmbedRespostaFake(self._resolver(entrada))
 
 
 class TestClassificarCategoria:
@@ -196,9 +199,45 @@ class TestClassificarCategoria:
 
         await mod.classificar_categoria(cliente, "modelo-embed", "titulo1", "descricao1", 1, usar_ia=True)
         chamadas_apos_primeira = cliente.chamadas
-        assert chamadas_apos_primeira == len(_CATEGORIAS_FAKE) + 1  # 3 categorias + 1 do chamado
+        assert chamadas_apos_primeira == 1 + 1  # 1 lote com as 3 categorias + 1 do chamado
 
         await mod.classificar_categoria(cliente, "modelo-embed", "titulo2", "descricao2", 1, usar_ia=True)
         # Segunda chamada só gera 1 embedding novo (o do chamado) — as
         # categorias já estão cacheadas.
         assert cliente.chamadas == chamadas_apos_primeira + 1
+
+
+class TestEmbeddingsEmLote:
+    async def test_categorias_sao_pedidas_em_lotes_do_tamanho_maximo(self, monkeypatch):
+        monkeypatch.setattr(mod, "_TAMANHO_LOTE_EMBEDDING", 2)
+        cliente = _OllamaEmbedFake()
+        tamanhos = []
+        embed_original = cliente.embed
+
+        async def _embed(**kwargs):
+            tamanhos.append(len(kwargs["input"]))
+            return await embed_original(**kwargs)
+
+        cliente.embed = _embed
+        await mod.aquecer_embeddings_categorias(cliente, "modelo-embed")
+
+        assert tamanhos == [2, 1]
+        assert set(mod._cache_embeddings_categorias) == {1, 2, 3}
+        assert mod._cache_embeddings_categorias[2] == _VETOR_POR_NOME["cat sistemas"]
+
+    async def test_provedor_que_nao_aceita_lista_cai_pra_um_por_vez(self):
+        class _SoTextoUnico:
+            def __init__(self):
+                self.entradas = []
+
+            async def embed(self, **kwargs):
+                self.entradas.append(kwargs["input"])
+                texto = kwargs["input"] if isinstance(kwargs["input"], str) else ""
+                return _EmbedRespostaFake(_VETOR_POR_NOME.get(texto, [1.0, 0.0, 0.0]))
+
+        cliente = _SoTextoUnico()
+        await mod.aquecer_embeddings_categorias(cliente, "modelo-embed")
+
+        assert isinstance(cliente.entradas[0], list)  # tentou o lote primeiro
+        assert cliente.entradas[1:] == ["cat infra", "cat sistemas", "cat processos"]
+        assert mod._cache_embeddings_categorias[3] == _VETOR_POR_NOME["cat processos"]

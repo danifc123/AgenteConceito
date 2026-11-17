@@ -34,6 +34,8 @@ from agente_oracle.tools.ti.glpi import AreaChamado
 _AREA_PADRAO: AreaChamado = "sistemas"
 
 _cache_embeddings_categorias: dict[int, list[float]] | None = None
+# Limite de textos por chamada do `embedText` da OCI.
+_TAMANHO_LOTE_EMBEDDING = 96
 
 
 @dataclass(frozen=True)
@@ -97,6 +99,16 @@ async def classificar_categoria(
     return ResultadoClassificacao(area=escolhida.area, categoria_id=escolhida.id, precisou_embedding=True)
 
 
+async def aquecer_embeddings_categorias(cliente_ia: ClienteEmbedIA, modelo_embedding: str) -> None:
+    """Gera (uma vez por processo) o embedding de todas as categorias
+    atribuíveis. O poller chama isso ANTES do lote, fora do limite de
+    tempo de cada chamado: logo depois de um restart (todo deploy), essa
+    carga inicial é ~211 chamadas de embedding em sequência, e não pode
+    ser cobrada do 1º chamado da fila. Levanta em caso de erro (quem
+    chama decide); o cache só é gravado se TODAS derem certo."""
+    await _embeddings_categorias_cacheados(cliente_ia, modelo_embedding)
+
+
 async def _melhor_categoria(
     cliente_ia: ClienteEmbedIA, modelo_embedding: str, titulo: str, descricao: str
 ) -> CategoriaGlpi:
@@ -118,11 +130,28 @@ async def _embeddings_categorias_cacheados(
 ) -> dict[int, list[float]]:
     global _cache_embeddings_categorias
     if _cache_embeddings_categorias is None:
-        _cache_embeddings_categorias = {
-            categoria.id: await _gerar_embedding(cliente_ia, modelo_embedding, categoria.nome)
-            for categoria in categorias.CATEGORIAS_ATRIBUIVEIS
-        }
+        todas = list(categorias.CATEGORIAS_ATRIBUIVEIS)
+        vetores: dict[int, list[float]] = {}
+        for inicio in range(0, len(todas), _TAMANHO_LOTE_EMBEDDING):
+            lote = todas[inicio : inicio + _TAMANHO_LOTE_EMBEDDING]
+            embeddings = await _gerar_embeddings_em_lote(cliente_ia, modelo_embedding, [c.nome for c in lote])
+            vetores.update(zip((c.id for c in lote), embeddings, strict=True))
+        _cache_embeddings_categorias = vetores
     return _cache_embeddings_categorias
+
+
+async def _gerar_embeddings_em_lote(
+    cliente_ia: ClienteEmbedIA, modelo_embedding: str, textos: list[str]
+) -> list[list[float]]:
+    """Um pedido com vários textos (a OCI aceita até 96 por chamada): o
+    aquecimento pós-restart cai de ~160 chamadas em sequência pra 2. Se o
+    provedor não devolver um vetor por texto (não aceita lista), refaz um
+    por vez, mesmo comportamento de antes."""
+    resposta = await cliente_ia.embed(model=modelo_embedding, input=textos)
+    embeddings = list(getattr(resposta, "embeddings", None) or [])
+    if len(embeddings) == len(textos):
+        return [list(embedding) for embedding in embeddings]
+    return [await _gerar_embedding(cliente_ia, modelo_embedding, texto) for texto in textos]
 
 
 async def _gerar_embedding(cliente_ia: ClienteEmbedIA, modelo_embedding: str, texto: str) -> list[float]:

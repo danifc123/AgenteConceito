@@ -149,8 +149,15 @@ class ClienteIAProtegido:
 
     async def embed(self, *, input, **kwargs):
         self._verificar_teto_tokens()
-        texto = sanitizar_dado_sensivel(input) if self._sanitizar else input
-        resposta = await self._cliente.embed(input=texto, **kwargs)
+        # `input` pode ser uma lista (lote de embeddings, ver
+        # `roteamento_chamado._gerar_embeddings_em_lote`): saneia cada item.
+        if isinstance(input, list):
+            entrada = [sanitizar_dado_sensivel(t) for t in input] if self._sanitizar else input
+            texto = "\n".join(entrada)
+        else:
+            entrada = sanitizar_dado_sensivel(input) if self._sanitizar else input
+            texto = entrada
+        resposta = await self._cliente.embed(input=entrada, **kwargs)
         self._registrar_e_avisar(texto, kwargs.get("model", ""), resposta)
         return resposta
 
@@ -221,6 +228,10 @@ def _provedor_llm_ativo(dominio: DominioIA) -> provedores_llm.ProvedorLLM | None
 # a instabilidade ocasional de rede sem multiplicar o tempo preso.
 _TIMEOUT_OPENAI_COMPATIVEL = httpx.Timeout(120.0, connect=10.0)
 _MAX_RETRIES_OPENAI_COMPATIVEL = 1
+# (conexão, leitura) do SDK nativo da OCI (só embedding). Embedding de um
+# texto curto volta em menos de 1s; 240s de leitura (valor anterior) só
+# servia pra segurar a triagem quando o endpoint parava de responder.
+_TIMEOUT_OCI_NATIVO = (10, 60)
 
 
 def construir_cliente_llm(provedor: ProvedorLLM) -> tuple[object, str]:
@@ -268,7 +279,7 @@ def construir_cliente_llm(provedor: ProvedorLLM) -> tuple[object, str]:
         config=config,
         service_endpoint=endpoint,
         retry_strategy=oci.retry.NoneRetryStrategy(),
-        timeout=(10, 240),
+        timeout=_TIMEOUT_OCI_NATIVO,
     )
     cliente_real = ClienteOciNativo(cliente_oci, credenciais.get("compartment_id", ""))
     return cliente_real, endpoint

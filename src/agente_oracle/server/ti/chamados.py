@@ -77,7 +77,7 @@ import logging
 import re
 import time
 from collections import deque
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Literal
@@ -88,12 +88,13 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 
 from agente_oracle.agent.ti.qualidade_chamado import TurnoConversa, avaliar_chamado
-from agente_oracle.agent.ti.roteamento_chamado import classificar_categoria
+from agente_oracle.agent.ti.roteamento_chamado import aquecer_embeddings_categorias, classificar_categoria
 from agente_oracle.config import settings
 from agente_oracle.db.connection import DatabaseError
 from agente_oracle.server.auth.decorador_rota import rota_protegida
 from agente_oracle.server.auth.dependencia import exigir_desenvolvedor, exigir_modulo_ti
 from agente_oracle.server.cors import CORS_HEADERS
+from agente_oracle.tools.ia.cliente_openai_compativel import EmbeddingNaoSuportado
 from agente_oracle.tools.ia.cliente_protegido import (
     USUARIO_SISTEMA,
     ClienteChatEmbedIA,
@@ -103,6 +104,7 @@ from agente_oracle.tools.ia.cliente_protegido import (
     modelo_embedding_ativo,
     modelo_ia_ativo,
 )
+from agente_oracle.tools.ia.disjuntor import DisjuntorIA
 from agente_oracle.tools.ti import amostragem_chamados, anexos_chamado, categorias, uso_ia_chamados
 from agente_oracle.tools.ti import configuracoes as configuracoes_tools
 from agente_oracle.tools.ti.glpi import (
@@ -132,6 +134,12 @@ _INTERVALO_POLLER_SEGUNDOS = 300
 # o fluxo já é seguro pra chamado "meio processado" (ver
 # `processar_chamado_novo`).
 _TIMEOUT_POR_CHAMADO_SEGUNDOS = 420
+
+# Teto pra gerar o embedding das ~211 categorias depois de um restart (ver
+# `_preparar_clientes_ia_da_rodada`). Normalmente leva bem menos (cada
+# embedding volta em <1s); se estourar, a rodada segue sem correção de
+# categoria (categoria atual mantida) e tenta de novo na próxima.
+_TIMEOUT_AQUECIMENTO_EMBEDDINGS_SEGUNDOS = 600
 
 _StatusEtapaPoller = Literal["pendente", "rodando", "concluido", "erro"]
 
@@ -615,10 +623,19 @@ async def _executar_uma_rodada() -> None:
         _estado_poller.ultima_rodada_em = datetime.now(UTC)
         return
 
+    # Mesmos clientes (e disjuntores) pras duas pernas: se a IA cair na 1ª,
+    # a 2ª já sabe e não espera o timeout de novo; e o aquecimento de
+    # embedding das categorias roda uma vez só.
+    clientes_ia = None
+    try:
+        clientes_ia = await _preparar_clientes_ia_da_rodada(usar_ia)
+    except Exception:
+        _logger.exception("Falha preparando os clientes de IA da rodada")
+
     _definir_etapa("chamados_novos", "rodando")
     _publicar_log("Verificando chamados novos…")
     try:
-        novos = await verificar_chamados_pendentes(usar_ia)
+        novos = await verificar_chamados_pendentes(usar_ia, clientes_ia)
         _definir_etapa("chamados_novos", "concluido", processados=novos)
         _publicar_log(f"{novos} chamado(s) novo(s) verificado(s)")
     except Exception as erro:
@@ -630,7 +647,7 @@ async def _executar_uma_rodada() -> None:
     _definir_etapa("chamados_aguardando_resposta", "rodando")
     _publicar_log("Verificando respostas novas…")
     try:
-        reprocessados = await verificar_chamados_aguardando_resposta(usar_ia)
+        reprocessados = await verificar_chamados_aguardando_resposta(usar_ia, clientes_ia)
         _definir_etapa("chamados_aguardando_resposta", "concluido", processados=reprocessados)
         _publicar_log(f"{reprocessados} resposta(s) nova(s) reprocessada(s)")
     except Exception as erro:
@@ -1033,7 +1050,53 @@ def _registrar_timeout_chamado(chamado: Chamado) -> None:
     )
 
 
-async def verificar_chamados_aguardando_resposta(usar_ia: bool) -> int:
+def _avisar_ia_indisponivel(tipo: str) -> Callable[[str, BaseException], None]:
+    def _avisar(_operacao: str, erro: BaseException) -> None:
+        _logger.warning("Provedor de IA (%s) não respondeu nesta rodada: %r", tipo, erro)
+        _publicar_log(
+            f"IA de {tipo} não respondeu ({type(erro).__name__}) — o restante desta rodada segue "
+            "sem ela (plano B), nova tentativa na próxima rodada"
+        )
+
+    return _avisar
+
+
+async def _preparar_clientes_ia_da_rodada(usar_ia: bool) -> tuple[DisjuntorIA, DisjuntorIA]:
+    """Clientes de chat e de embedding de UMA perna do poller, cada um
+    atrás de um `DisjuntorIA` próprio (ver `tools/ia/disjuntor.py`): se o
+    provedor parar de responder, só o 1º chamado espera o timeout; o resto
+    do lote cai direto no plano B em vez de esperar de novo, um por um.
+
+    Também aquece o cache de embedding das categorias antes do lote, fora
+    do limite de cada chamado. Falhou (timeout, provedor fora, provedor sem
+    embedding), o disjuntor de embedding já abre e os chamados desta rodada
+    mantêm a categoria atual, sem ninguém tentar regerar o cache inteiro
+    dentro do próprio limite."""
+    cliente_ia = DisjuntorIA(
+        criar_cliente_protegido(settings, "ti", sanitizar=True, usuario_id=USUARIO_SISTEMA),
+        ao_abrir=_avisar_ia_indisponivel("avaliação"),
+    )
+    embedding_client = DisjuntorIA(
+        criar_cliente_embedding_protegido(settings, "ti", sanitizar=True, usuario_id=USUARIO_SISTEMA),
+        ao_abrir=_avisar_ia_indisponivel("categoria (embedding)"),
+    )
+    if usar_ia:
+        try:
+            await asyncio.wait_for(
+                aquecer_embeddings_categorias(embedding_client, modelo_embedding_ativo(settings, "ti")),
+                timeout=_TIMEOUT_AQUECIMENTO_EMBEDDINGS_SEGUNDOS,
+            )
+        except EmbeddingNaoSuportado:
+            pass  # provedor sem embedding: `classificar_categoria` já trata, sem custo de rede
+        except Exception as erro:
+            _logger.warning("Falha gerando o embedding das categorias: %r", erro)
+            embedding_client.abrir("embed", erro)
+    return cliente_ia, embedding_client
+
+
+async def verificar_chamados_aguardando_resposta(
+    usar_ia: bool, clientes_ia: tuple[DisjuntorIA, DisjuntorIA] | None = None
+) -> int:
     """Segunda perna do poller: chamado `novo` é coberto por
     `verificar_chamados_pendentes`, chamado `aguardando_usuario` é coberto
     aqui — só reavalia quando detecta uma resposta NOVA (Followup mais
@@ -1061,8 +1124,7 @@ async def verificar_chamados_aguardando_resposta(usar_ia: bool) -> int:
     diferentes num lote só — mesmo quando disparado pela rota manual (não
     só pelo poller), atribuir o custo todo a quem clicou "Verificar" seria
     enganoso (ver `tools/ia/cliente_protegido.py::USUARIO_SISTEMA`)."""
-    cliente_ia = criar_cliente_protegido(settings, "ti", sanitizar=True, usuario_id=USUARIO_SISTEMA)
-    embedding_client = criar_cliente_embedding_protegido(settings, "ti", sanitizar=True, usuario_id=USUARIO_SISTEMA)
+    cliente_ia, embedding_client = clientes_ia or await _preparar_clientes_ia_da_rodada(usar_ia)
     tecnicos = await to_thread.run_sync(todos_os_tecnicos)
     cargas = await _cliente.carga_atual_por_tecnico([tecnico.identificador for tecnico in tecnicos])
 
@@ -1117,7 +1179,9 @@ async def verificar_chamados_aguardando_resposta(usar_ia: bool) -> int:
     return processados
 
 
-async def verificar_chamados_pendentes(usar_ia: bool) -> int:
+async def verificar_chamados_pendentes(
+    usar_ia: bool, clientes_ia: tuple[DisjuntorIA, DisjuntorIA] | None = None
+) -> int:
     """Roda `processar_chamado_novo` só em chamado `novo` — `listar()`
     também devolve `aguardando_usuario` (é o que a tela mostra), mas
     reprocessar esses é trabalho de `verificar_chamados_aguardando_resposta`,
@@ -1153,8 +1217,7 @@ async def verificar_chamados_pendentes(usar_ia: bool) -> int:
     `usuario_id=USUARIO_SISTEMA`: mesmo motivo de
     `verificar_chamados_aguardando_resposta` — é um lote de vários
     chamados de pessoas diferentes, não a ação de quem disparou."""
-    cliente_ia = criar_cliente_protegido(settings, "ti", sanitizar=True, usuario_id=USUARIO_SISTEMA)
-    embedding_client = criar_cliente_embedding_protegido(settings, "ti", sanitizar=True, usuario_id=USUARIO_SISTEMA)
+    cliente_ia, embedding_client = clientes_ia or await _preparar_clientes_ia_da_rodada(usar_ia)
     tecnicos = await to_thread.run_sync(todos_os_tecnicos)
     cargas = await _cliente.carga_atual_por_tecnico([tecnico.identificador for tecnico in tecnicos])
 
